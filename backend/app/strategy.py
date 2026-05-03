@@ -33,8 +33,22 @@ PIP = 0.0001  # legacy alias, EUR/USD style
 
 
 def pip_size(instrument: str) -> float:
-    """Return one pip in price units for the given instrument."""
-    return 0.01 if "JPY" in instrument else 0.0001
+    """Return one pip in price units for the given instrument.
+
+    Conventions:
+    - Major FX (EUR/USD, GBP/USD, USD/CAD, ...): 0.0001 (4th decimal)
+    - JPY pairs:                                  0.01   (2nd decimal)
+    - Gold (XAU/USD), silver (XAG/USD):           0.10   (10 cents/oz)
+    - Crypto (BTC/USD, ETH/USD):                  1.0    (1 dollar)
+    """
+    if "JPY" in instrument:
+        return 0.01
+    base = instrument.split("_")[0] if "_" in instrument else instrument
+    if base in ("XAU", "XAG"):
+        return 0.10
+    if base in ("BTC", "ETH", "LTC", "XRP"):
+        return 1.0
+    return 0.0001
 
 
 def is_jpy_quote(instrument: str) -> bool:

@@ -135,6 +135,11 @@ def main() -> int:
                     help="Override .env INSTRUMENT for this run only")
     ap.add_argument("--granularity", default=None,
                     help="Override .env GRANULARITY for this run only")
+    ap.add_argument("--spread-pips", type=float, default=0.5,
+                    help="Per-side spread cost in pips (FX default 0.5; "
+                         "XAU/USD ~30; BTC much higher)")
+    ap.add_argument("--slippage-pips", type=float, default=0.2,
+                    help="Per-side slippage cost in pips")
     args = ap.parse_args()
 
     if args.instrument:
@@ -162,13 +167,16 @@ def main() -> int:
 
     is_result, is_trades, is_eq, is_diag = run_backtest(
         is_candles, starting_equity=args.equity, params=StrategyParams(),
+        spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
     )
     oos_result, oos_trades, oos_eq, oos_diag = run_backtest(
         oos_candles, starting_equity=args.equity, params=StrategyParams(),
+        spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
     )
     fr_result, fr_trades, fr_eq, fr_diag = run_backtest(
         candles, starting_equity=args.equity, params=StrategyParams(),
-        spread_pips=1.0, slippage_pips=0.4,
+        spread_pips=2.0 * args.spread_pips,
+        slippage_pips=2.0 * args.slippage_pips,
     )
 
     save_results(is_result, is_trades, is_eq, is_diag, label=f"{args.label}_IS")
