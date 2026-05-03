@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fxtrader-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5179", "--strictPort"],
+      "cwd": "/Users/xynkro/Documents/Trading/FXTrader/frontend",
+      "port": 5179
+    }
+  ]
+}

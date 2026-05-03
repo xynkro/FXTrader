@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+.panel {
+  @apply bg-panel border border-border rounded-lg;
+}
+
+.btn {
+  @apply px-3 py-2 rounded-md text-sm font-semibold border transition-colors;
+}
+.btn-go      { @apply btn bg-accent/10  border-accent/40  text-accent  hover:bg-accent/20; }
+.btn-stop    { @apply btn bg-warn/10    border-warn/40    text-warn    hover:bg-warn/20; }
+.btn-kill    { @apply btn bg-danger/10  border-danger/50  text-danger  hover:bg-danger/20; }
+.btn-ghost   { @apply btn bg-transparent border-border    text-neutral-300 hover:bg-panel; }
+
+.kv-row { @apply flex justify-between text-sm py-1 border-b border-border/40 last:border-0; }
+.kv-key { @apply text-muted; }
+.kv-val { @apply text-neutral-100; }
+
+.tag        { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold; }
+.tag-on     { @apply tag bg-accent/15  text-accent; }
+.tag-off    { @apply tag bg-neutral-700/40 text-neutral-300; }
+.tag-warn   { @apply tag bg-warn/15    text-warn; }
+.tag-danger { @apply tag bg-danger/20  text-danger; }
