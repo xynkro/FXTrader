@@ -37,10 +37,12 @@ import numpy as np
 
 from .config import settings
 from .models import BacktestResult, Candle, Side
+from typing import Callable
+
 from .strategy import (
     StrategyParams,
     StrategyState,
-    evaluate,
+    evaluate as evaluate_default,
     in_session,
     is_jpy_quote,
     pip_size,
@@ -97,12 +99,14 @@ def run_backtest(
     spread_pips: float = 0.5,
     slippage_pips: float = 0.2,
     session_filter: bool = True,
+    evaluate_fn: Optional[Callable] = None,
 ) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]], dict]:
     if not candles:
         raise ValueError("no candles supplied")
 
     p = params or StrategyParams()
     state = StrategyState(params=p)
+    eval_fn = evaluate_fn or evaluate_default
     diag = BTDiagnostics()
     trades: list[BTTrade] = []
     equity_curve: list[tuple[str, float]] = [
@@ -220,7 +224,7 @@ def run_backtest(
             and pending_signal is None
             and (not session_filter or in_session(bar.time))
         ):
-            sig = evaluate(state, equity, diagnostics=diag.skips)
+            sig = eval_fn(state, equity, diagnostics=diag.skips)
             if sig is not None:
                 pending_signal = sig
 

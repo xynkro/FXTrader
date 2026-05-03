@@ -87,19 +87,36 @@ def in_session(dt: datetime) -> bool:
 # --- params + state ------------------------------------------------------
 @dataclass
 class StrategyParams:
-    donchian_period: int = 20
+    # shared across all classes
     atr_period: int = 14
     stop_atr_mult: float = 2.0          # K
     min_atr_pips: float = 3.0
     min_stop_pips: float = 5.0
     max_leverage: float = 30.0
-    cooldown_bars: int = 20             # = donchian_period by default
+    cooldown_bars: int = 20
+
+    # Class A — Donchian
+    donchian_period: int = 20
+
+    # Class B — Pullback-in-trend
+    sma_long: int = 100
+    sma_short: int = 20
+    pullback_lookback: int = 3       # bars in which low/high must touch SMA_short
+    trend_slope_lookback: int = 10   # how far back to measure SMA_long slope
+
+    # Class C — Volatility compression -> expansion
+    bb_period: int = 20
+    bb_mult: float = 2.0
+    compression_lookback: int = 100  # window for percentile rank of BB width
+    compression_pct: float = 30.0    # below this percentile = compressed
 
 
 @dataclass
 class StrategyState:
     params: StrategyParams = field(default_factory=StrategyParams)
-    candles: deque = field(default_factory=lambda: deque(maxlen=200))
+    # Bigger window so pullback (sma_long=100) and compression (lookback=100)
+    # have full warmup history available.
+    candles: deque = field(default_factory=lambda: deque(maxlen=300))
     long_cooldown: int = 0
     short_cooldown: int = 0
 
@@ -118,11 +135,8 @@ class StrategyState:
         else:
             self.short_cooldown = self.params.cooldown_bars
 
-    def warm(self) -> bool:
-        return len(self.candles) >= max(
-            self.params.donchian_period + 1,
-            self.params.atr_period + 1,
-        )
+    def warm(self, min_bars: int) -> bool:
+        return len(self.candles) >= min_bars
 
 
 # --- sizing --------------------------------------------------------------
@@ -161,31 +175,27 @@ def position_size(
     return max(risk_units, 0), False
 
 
-# --- signal --------------------------------------------------------------
-def evaluate(
+# --- shared signal preamble ---------------------------------------------
+def _preamble(
     state: StrategyState,
-    equity: float = 0.0,
-    diagnostics: Optional[dict] = None,
-) -> Optional[Signal]:
-    """Generate a signal at bar t close. Caller fills at bar t+1 open.
-
-    `equity` kept for API compat; not used. If `diagnostics` dict is passed,
-    reasons for skipping (warmup, atr_min, min_stop, cooldown_*) are tallied.
-    """
-    def skip(key: str) -> None:
+    diagnostics: Optional[dict],
+    min_warmup: int,
+):
+    """Common gate checks. Returns either a tuple (candles, p, closes, highs,
+    lows, atr_value, stop_distance, pip, last) ready for evaluation, or
+    a `None` from `skip(...)` already recorded in diagnostics."""
+    def skip(key: str):
         if diagnostics is not None:
             k = f"skip_{key}"
             diagnostics[k] = diagnostics.get(k, 0) + 1
         return None
 
-    if not state.warm():
-        return skip("warmup")
-
+    if not state.warm(min_warmup):
+        return skip("warmup"), None
     candles = list(state.candles)
     last = candles[-1]
-
     if not in_session(last.time):
-        return skip("out_of_session")
+        return skip("out_of_session"), None
 
     p = state.params
     closes = np.array([c.close for c in candles], dtype=float)
@@ -194,51 +204,223 @@ def evaluate(
 
     a = atr(highs, lows, closes, p.atr_period)
     if np.isnan(a):
-        return skip("warmup")
-
+        return skip("warmup"), None
     pip = pip_size(settings.INSTRUMENT)
     atr_pips = a / pip
     if atr_pips < p.min_atr_pips:
-        return skip("atr_below_min")
-
+        return skip("atr_below_min"), None
     stop_distance = p.stop_atr_mult * a
     if stop_distance < p.min_stop_pips * pip:
-        return skip("stop_below_min")
+        return skip("stop_below_min"), None
+
+    return None, dict(
+        candles=candles, p=p, last=last, closes=closes, highs=highs, lows=lows,
+        atr=a, atr_pips=atr_pips, pip=pip, stop_distance=stop_distance,
+    )
+
+
+def _record_skip(diagnostics: Optional[dict], key: str) -> None:
+    if diagnostics is not None:
+        k = f"skip_{key}"
+        diagnostics[k] = diagnostics.get(k, 0) + 1
+
+
+# --- Class A: Donchian breakout -----------------------------------------
+def evaluate_donchian(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+    pre_skip, ctx = _preamble(state, diagnostics,
+                               min_warmup=max(p.donchian_period + 1,
+                                              p.atr_period + 1))
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    highs, lows = ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
 
     n = p.donchian_period
-    if len(closes) < n + 1:
-        return skip("warmup")
-    # Donchian channel: high/low of the previous N CLOSED bars (excludes current)
     prev_high = float(highs[-n - 1 : -1].max())
     prev_low  = float(lows[ -n - 1 : -1].min())
 
-    # LONG breakout
     if last.close > prev_high:
         if state.long_cooldown > 0:
-            return skip("cooldown_long")
+            _record_skip(diagnostics, "cooldown_long"); return None
         return Signal(
-            time=last.time,
-            side=Side.LONG,
-            entry=last.close,
-            stop=last.close - stop_distance,
-            target=None,
-            atr=a,
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
             stop_distance=stop_distance,
-            reason=f"long_breakout N{n} ATR{atr_pips:.1f}p prev_hi={prev_high:.5f}",
+            reason=f"donchian_long N{n} ATR{atr_pips:.1f}p hi={prev_high:.5f}",
         )
-    # SHORT breakout
     if last.close < prev_low:
         if state.short_cooldown > 0:
-            return skip("cooldown_short")
+            _record_skip(diagnostics, "cooldown_short"); return None
         return Signal(
-            time=last.time,
-            side=Side.SHORT,
-            entry=last.close,
-            stop=last.close + stop_distance,
-            target=None,
-            atr=a,
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
             stop_distance=stop_distance,
-            reason=f"short_breakout N{n} ATR{atr_pips:.1f}p prev_lo={prev_low:.5f}",
+            reason=f"donchian_short N{n} ATR{atr_pips:.1f}p lo={prev_low:.5f}",
+        )
+    _record_skip(diagnostics, "no_breakout"); return None
+
+
+# --- Class B: Pullback-in-trend -----------------------------------------
+def evaluate_pullback(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.sma_long + p.trend_slope_lookback,
+                       p.atr_period + 1, p.pullback_lookback + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+
+    # Recent pullback window: last `pullback_lookback` bars (excluding current)
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_at_i = float(closes[-p.sma_short - i : -i].mean()) if i > 0 else sma_short_now
+        sma_short_window.append(sma_short_at_i)
+
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback_touched = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback_touched = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    up_trend = last.close > sma_long_now and sma_long_now > sma_long_prev
+    down_trend = last.close < sma_long_now and sma_long_now < sma_long_prev
+
+    if up_trend and last.close > sma_short_now and long_pullback_touched:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"pullback_long sma_l={sma_long_now:.5f} sma_s={sma_short_now:.5f} "
+                f"ATR{atr_pips:.1f}p"
+            ),
+        )
+    if down_trend and last.close < sma_short_now and short_pullback_touched:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"pullback_short sma_l={sma_long_now:.5f} sma_s={sma_short_now:.5f} "
+                f"ATR{atr_pips:.1f}p"
+            ),
         )
 
-    return skip("no_breakout")
+    _record_skip(diagnostics, "no_pullback_setup"); return None
+
+
+# --- Class C: Volatility compression -> expansion -----------------------
+def evaluate_volsqueeze(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.bb_period + p.compression_lookback,
+                       p.atr_period + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes = ctx["closes"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    # Rolling BB(20) widths (as % of SMA20) over the last
+    # compression_lookback bars, including current.
+    widths_pct: list[float] = []
+    for i in range(p.compression_lookback):
+        end = len(closes) - i
+        window = closes[end - p.bb_period : end]
+        m = float(window.mean()); sd = float(window.std(ddof=0))
+        upper = m + p.bb_mult * sd
+        lower = m - p.bb_mult * sd
+        if m > 0:
+            widths_pct.append((upper - lower) / m)
+    widths_pct.reverse()  # oldest first
+
+    if len(widths_pct) < p.compression_lookback:
+        _record_skip(diagnostics, "warmup"); return None
+
+    current_width_pct = widths_pct[-1]
+    threshold = float(np.percentile(widths_pct, p.compression_pct))
+    compressed = current_width_pct < threshold
+
+    if not compressed:
+        _record_skip(diagnostics, "not_compressed"); return None
+
+    # Last bar's BB(20) bands
+    window = closes[-p.bb_period:]
+    m = float(window.mean()); sd = float(window.std(ddof=0))
+    upper = m + p.bb_mult * sd
+    lower = m - p.bb_mult * sd
+
+    if last.close > upper:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"squeeze_long bb_up={upper:.5f} w%={current_width_pct*100:.3f} "
+                f"thr={threshold*100:.3f} ATR{atr_pips:.1f}p"
+            ),
+        )
+    if last.close < lower:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"squeeze_short bb_lo={lower:.5f} w%={current_width_pct*100:.3f} "
+                f"thr={threshold*100:.3f} ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    _record_skip(diagnostics, "no_breakout_in_squeeze"); return None
+
+
+# Backwards-compat alias used by trader.py / backtest.py default.
+evaluate = evaluate_donchian
+
+
+STRATEGIES = {
+    "donchian":   evaluate_donchian,
+    "pullback":   evaluate_pullback,
+    "volsqueeze": evaluate_volsqueeze,
+}

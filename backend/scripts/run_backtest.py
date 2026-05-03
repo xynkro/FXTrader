@@ -11,7 +11,7 @@ from pathlib import Path
 from app.backtest import run_backtest, save_results
 from app.config import settings
 from app.models import Candle
-from app.strategy import StrategyParams
+from app.strategy import STRATEGIES, StrategyParams
 
 
 def load_candles(path: Path) -> list[Candle]:
@@ -137,9 +137,12 @@ def main() -> int:
                     help="Override .env GRANULARITY for this run only")
     ap.add_argument("--spread-pips", type=float, default=0.5,
                     help="Per-side spread cost in pips (FX default 0.5; "
-                         "XAU/USD ~30; BTC much higher)")
+                         "XAU/USD ~5; BTC much higher)")
     ap.add_argument("--slippage-pips", type=float, default=0.2,
                     help="Per-side slippage cost in pips")
+    ap.add_argument("--strategy", choices=sorted(STRATEGIES.keys()),
+                    default="donchian",
+                    help="Which entry logic to test (default: donchian)")
     args = ap.parse_args()
 
     if args.instrument:
@@ -165,18 +168,23 @@ def main() -> int:
     is_candles = candles[:split]
     oos_candles = candles[split:]
 
+    eval_fn = STRATEGIES[args.strategy]
+
     is_result, is_trades, is_eq, is_diag = run_backtest(
         is_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
+        evaluate_fn=eval_fn,
     )
     oos_result, oos_trades, oos_eq, oos_diag = run_backtest(
         oos_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
+        evaluate_fn=eval_fn,
     )
     fr_result, fr_trades, fr_eq, fr_diag = run_backtest(
         candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=2.0 * args.spread_pips,
         slippage_pips=2.0 * args.slippage_pips,
+        evaluate_fn=eval_fn,
     )
 
     save_results(is_result, is_trades, is_eq, is_diag, label=f"{args.label}_IS")
@@ -185,7 +193,8 @@ def main() -> int:
 
     line = "=" * 68
     print(line)
-    print(f"  v1-B Donchian breakout intraday — {instrument} {granularity}")
+    print(f"  Bake-off entry: [{args.strategy.upper()}] — "
+          f"{instrument} {granularity}")
     print(line)
 
     # 1 + 2: IS / OOS full stats
