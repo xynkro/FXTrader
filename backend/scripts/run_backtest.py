@@ -196,6 +196,16 @@ def main() -> int:
     print(f"  IS : {is_diag.get('top5_winner_concentration_pct', 0):.1f}% of gross profit")
     print(f"  OOS: {oos_diag.get('top5_winner_concentration_pct', 0):.1f}% of gross profit")
 
+    # 5b: exit-type breakdown (added for H4 diagnosis)
+    print("\n--- Exit-type breakdown ---")
+    for label, r, d in [("IS", is_result, is_diag),
+                        ("OOS", oos_result, oos_diag),
+                        ("FRICTION", fr_result, fr_diag)]:
+        er = d.get("exit_reasons", {})
+        total = max(r.trades, 1)
+        parts = [f"{k}={v} ({100*v/total:.0f}%)" for k, v in sorted(er.items())]
+        print(f"  {label}: {', '.join(parts) if parts else '(no trades)'}")
+
     # 6: friction shock
     print()
     print(fmt_summary(

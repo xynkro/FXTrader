@@ -130,8 +130,12 @@ def run_backtest(
                 exit_price = _apply_costs(
                     side, stop, "exit", spread_pips, slippage_pips
                 )
+                stop_label = (
+                    "trailing_stop" if open_trade.get("trailed", False)
+                    else "initial_stop"
+                )
                 equity = _close_trade(
-                    open_trade, exit_price, bar.time, "stop",
+                    open_trade, exit_price, bar.time, stop_label,
                     trades, equity_curve, equity,
                 )
                 state.trip_cooldown(side)   # cooldown ONLY after stop-out
@@ -227,10 +231,12 @@ def run_backtest(
                 trail = ext - stop_dist
                 if trail > open_trade["stop"]:
                     open_trade["next_stop"] = trail
+                    open_trade["trailed"] = True
             else:
                 trail = ext + stop_dist
                 if trail < open_trade["stop"]:
                     open_trade["next_stop"] = trail
+                    open_trade["trailed"] = True
 
     # Close dangling trade at last bar's close
     if open_trade is not None:
