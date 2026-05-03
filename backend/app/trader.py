@@ -128,11 +128,33 @@ class Engine:
 
     # ------------------------------------------------------------------
     async def _open_trade_from_signal(self, sig, equity: float) -> None:
-        units, leverage_capped = position_size(equity, sig.entry, sig.stop)
+        # Capture spread + bid/ask + quote->account conversion at signal time.
+        # This is the foundation for account-currency-aware sizing.
+        try:
+            bid_at_signal, ask_at_signal, q2a_rate = (
+                await self.client.pricing_with_conversion(settings.INSTRUMENT)
+            )
+            spread_at_signal = ask_at_signal - bid_at_signal
+            mid_at_signal = (bid_at_signal + ask_at_signal) / 2.0
+        except OandaError:
+            bid_at_signal = ask_at_signal = spread_at_signal = None
+            mid_at_signal = sig.entry
+            q2a_rate = None  # let position_size fall back to backtest-style assumption
+
+        pip = pip_size(settings.INSTRUMENT)
+        spread_pips = (
+            spread_at_signal / pip if spread_at_signal is not None else None
+        )
+
+        units, leverage_capped = position_size(
+            equity, sig.entry, sig.stop,
+            quote_to_account_rate=q2a_rate,
+        )
         if units <= 0:
             trade_log.log_event(
                 "WARN", "size_zero",
-                f"computed 0 units for entry={sig.entry} stop={sig.stop}",
+                f"computed 0 units entry={sig.entry} stop={sig.stop} "
+                f"q2a={q2a_rate}",
             )
             return
         if leverage_capped:
@@ -140,23 +162,26 @@ class Engine:
                 "WARN", "leverage_capped",
                 f"units capped to {units} on entry={sig.entry}",
             )
-        signed_units = units if sig.side == Side.LONG else -units
 
-        # Capture spread + bid/ask at signal time for observability.
-        try:
-            bid_at_signal, ask_at_signal = await self.client.current_price(
-                settings.INSTRUMENT
+        # Realised risk vs intended risk — observability for kill criterion 1
+        # and parity audit (so any mismatch is caught immediately).
+        intended_risk_pct = settings.RISK_PER_TRADE_PCT
+        if q2a_rate is not None and equity > 0:
+            realised_risk_acct = (
+                units * abs(sig.entry - sig.stop) * q2a_rate
             )
-            spread_at_signal = ask_at_signal - bid_at_signal
-            mid_at_signal = (bid_at_signal + ask_at_signal) / 2.0
-        except OandaError:
-            bid_at_signal = ask_at_signal = spread_at_signal = None
-            mid_at_signal = sig.entry
-
-        pip = pip_size(settings.INSTRUMENT)
-        spread_pips = (
-            spread_at_signal / pip if spread_at_signal is not None else None
+            realised_risk_pct = 100.0 * realised_risk_acct / equity
+        else:
+            realised_risk_pct = float("nan")
+        trade_log.log_event(
+            "INFO", "sizing",
+            f"units={units} q2a={q2a_rate} "
+            f"intended_risk_pct={intended_risk_pct:.3f} "
+            f"realised_risk_pct={realised_risk_pct:.3f} "
+            f"leverage_capped={leverage_capped}",
         )
+
+        signed_units = units if sig.side == Side.LONG else -units
 
         if settings.SHADOW_MODE:
             # Synthesize a fill at the appropriate side of the live spread

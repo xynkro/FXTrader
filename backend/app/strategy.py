@@ -146,29 +146,48 @@ def position_size(
     stop: float,
     max_leverage: float = 30.0,
     instrument: Optional[str] = None,
+    quote_to_account_rate: Optional[float] = None,
 ) -> tuple[int, bool]:
     """Return (units, leverage_capped). units >= 0.
 
-    USD account assumed. Two cases:
-      - quote = USD (e.g. EUR_USD): 1 unit = 1 EUR; P&L in USD = units × Δprice.
-        size: units = risk_$ / |entry - stop|; leverage cap: units × entry ≤ L × equity.
-      - quote = JPY (e.g. USD_JPY): 1 unit = 1 USD; P&L in JPY = units × Δprice;
-        ≈ converted by /entry. So |entry - stop| / entry ≈ % change ≈ USD-risk per
-        unit. size: units = risk_$ × entry / |entry - stop|; notional in USD = units;
-        leverage cap: units ≤ L × equity.
+    Generalised, account-currency aware sizing.
+
+    For ANY pair BASE_QUOTE on an account in currency ACCT:
+      - 1 unit of position = 1 unit of BASE
+      - P&L per unit per Δprice (price = QUOTE per BASE) = Δprice  QUOTE
+      - P&L per unit per Δprice in ACCT = Δprice × q2a, where q2a is
+        units of ACCT per 1 unit of QUOTE.
+      - Risk per unit at stop = |entry - stop| × q2a  ACCT
+      - units to risk R ACCT: N = R / (|entry - stop| × q2a)
+      - Notional per unit in ACCT = entry × q2a (since 1 unit BASE
+        = entry QUOTE = entry × q2a ACCT)
+      - Leverage cap: N × notional_per_unit ≤ max_leverage × equity
+
+    `quote_to_account_rate` should be passed by the caller (live engine
+    queries OANDA's quoteHomeConversionFactors for it).
+
+    For backtests, if not provided, we fall back to the implicit USD-account
+    convention (rate = 1/entry for JPY-quote, 1.0 otherwise) so historical
+    results stay reproducible.
     """
     inst = instrument or settings.INSTRUMENT
-    risk_dollars = equity * (settings.RISK_PER_TRADE_PCT / 100.0)
+    risk_acct = equity * (settings.RISK_PER_TRADE_PCT / 100.0)
     distance = abs(entry - stop)
     if distance <= 0 or entry <= 0:
         return 0, False
 
-    if is_jpy_quote(inst):
-        risk_units = int(risk_dollars * entry / distance)
-        max_units = int(max_leverage * equity)
-    else:
-        risk_units = int(risk_dollars / distance)
-        max_units = int(max_leverage * equity / entry)
+    if quote_to_account_rate is None:
+        quote_to_account_rate = (1.0 / entry) if is_jpy_quote(inst) else 1.0
+
+    risk_per_unit = distance * quote_to_account_rate
+    if risk_per_unit <= 0:
+        return 0, False
+    risk_units = int(risk_acct / risk_per_unit)
+
+    notional_per_unit = entry * quote_to_account_rate
+    if notional_per_unit <= 0:
+        return 0, False
+    max_units = int(max_leverage * equity / notional_per_unit)
 
     if risk_units > max_units:
         return max_units, True

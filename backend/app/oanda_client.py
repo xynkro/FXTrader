@@ -131,6 +131,53 @@ class OandaClient:
     async def current_price(self, instrument: str) -> tuple[float, float]:
         return await asyncio.to_thread(self._current_price_sync, instrument)
 
+    # --------- pricing + home-currency conversion -------------------------
+    def _pricing_with_conversion_sync(self, instrument: str) -> dict:
+        r = pricing.PricingInfo(
+            accountID=self.account_id, params={"instruments": instrument}
+        )
+        try:
+            self.api.request(r)
+        except V20Error as e:
+            raise OandaError(f"PricingInfo failed: {e}") from e
+        return r.response
+
+    async def pricing_with_conversion(
+        self, instrument: str
+    ) -> tuple[float, float, float]:
+        """Return (bid, ask, quote_to_account_rate).
+
+        `quote_to_account_rate` = how many units of the account currency
+        equal 1 unit of the instrument's QUOTE currency, at the moment of
+        the request. Used for account-currency-aware position sizing.
+
+        OANDA exposes this via `quoteHomeConversionFactors` on the price
+        record (modern v20). Falls back to top-level `homeConversions`
+        and finally to 1.0 if nothing is found (USD account on USD-quote
+        pair will land here cleanly).
+        """
+        resp = await asyncio.to_thread(
+            self._pricing_with_conversion_sync, instrument
+        )
+        p = resp["prices"][0]
+        bid = float(p["bids"][0]["price"])
+        ask = float(p["asks"][0]["price"])
+
+        qhcf = p.get("quoteHomeConversionFactors")
+        if qhcf:
+            pos = float(qhcf.get("positiveUnits", "1.0"))
+            neg = float(qhcf.get("negativeUnits", "1.0"))
+            return bid, ask, (pos + neg) / 2.0
+
+        quote_ccy = instrument.split("_")[1] if "_" in instrument else None
+        for hc in resp.get("homeConversions", []):
+            if hc.get("currency") == quote_ccy:
+                # OANDA returns this as positionValue in newer schemas
+                rate = hc.get("positionValue") or hc.get("accountGain") or "1.0"
+                return bid, ask, float(rate)
+
+        return bid, ask, 1.0
+
     # ----------------------------- orders ----------------------------------
     def _market_order_sync(
         self,
