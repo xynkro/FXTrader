@@ -74,9 +74,28 @@ the trade-count gate is the binding one — likely a 6-to-8-week observation.
 
 ## Kill criteria (any one trips the switch immediately)
 
-1. **Friction divergence**. If realised round-trip spread + slippage averaged
-   over 10+ trades is more than **2× the backtest model** (i.e. > 1.8 pip
-   round-trip equivalent), stop. The backtest envelope no longer applies.
+1. **Friction divergence**. If realised round-trip cost averaged over 10+
+   closed trades exceeds **1.8 pips** (= 2× the backtest model of 0.9 pips),
+   stop.
+
+   **Round-trip cost is precisely defined as:**
+   ```
+   round_trip_cost_pips =
+       (ask_at_signal − bid_at_signal)        # entry spread, full pips
+     + |fill_price − mid_at_signal| / pip     # entry slippage
+     + |exit_price − mid_at_exit|  / pip      # exit slippage
+   ```
+   Adverse stop *execution drift* (e.g. stop fills several pips beyond
+   the trigger price during fast moves) is **not** counted toward
+   criterion 1 — that's measured separately under criterion 3
+   (behavioural drift) since it's a market-microstructure concern, not
+   a baseline-cost concern.
+
+   The backtest charges 0.5 pip half-spread on each side (= 1.0 pip
+   round-trip spread) plus 0.2 pip slippage per side (= 0.4 pip
+   round-trip slippage), totalling **0.9 pips round-trip**. Live cost
+   over 1.8 pips means we're paying double — at that point the backtest
+   envelope no longer maps to reality.
 2. **Execution errors**. Any `order_failed`, `kill_close_failed`, or
    `tick_exception` event appearing more than twice in any 24h period. The
    engine itself is the unreliable component.

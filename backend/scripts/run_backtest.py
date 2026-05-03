@@ -131,7 +131,16 @@ def main() -> int:
     ap.add_argument("--equity", type=float, default=10_000.0)
     ap.add_argument("--in-sample-pct", type=int, default=80)
     ap.add_argument("--label", default="v1B")
+    ap.add_argument("--instrument", default=None,
+                    help="Override .env INSTRUMENT for this run only")
+    ap.add_argument("--granularity", default=None,
+                    help="Override .env GRANULARITY for this run only")
     args = ap.parse_args()
+
+    if args.instrument:
+        settings.INSTRUMENT = args.instrument
+    if args.granularity:
+        settings.GRANULARITY = args.granularity
 
     instrument = settings.INSTRUMENT
     granularity = settings.GRANULARITY
