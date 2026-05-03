@@ -73,14 +73,31 @@ Method:
 - At end, compute the same diagnostics as backtest: avg duration,
   exit-mix, cost-as-%-of-stop, expectancy, PF.
 
-Pre-registered reading:
-- Pass: shadow behaviour stays inside backtest envelope on:
-  - Avg duration: within ±50% of backtest median (4 bars → range 2–6)
-  - Exit-mix: trailing_stop > 30%, initial_stop < 20%, session_end ~50%
-  - Realised round-trip cost (entry spread + entry slip + exit slip):
-    < 1.8 pip (= 2× backtest model)
-- Fail: any of the above out of envelope. Strategy is doing something
-  meaningfully different live than the backtest models.
+**Envelope to compare against — Pullback no-session-close, USD/JPY H1**
+(extracted from `backtest_results/.../diagnostics.json`):
+
+| | IS | OOS | Friction (full sample) |
+|---|---|---|---|
+| Avg bars held | 9.6 | 9.4 | 9.5 |
+| Median bars held | 5 | 6 | 5 |
+| Trailing-stop exits | 96.5% | 97.2% | 95.6% |
+| Initial-stop exits | 3.5% | 2.8% | 4.4% |
+| Session-end exits | 0% | 0% | 0% |
+| Cost % of stop | 2.74% | 2.32% | 5.33% |
+
+Pre-registered reading (revised against the correct no-session envelope):
+- **Pass** if shadow behaviour stays inside this envelope on:
+  - **Median duration**: within ±50% of backtest median 5 → **range 3–8 bars**
+  - **Avg duration**: within ±50% of backtest avg 9.5 → **range 5–14 bars**
+  - **Exit-mix**: trailing_stop ≥ 80%, initial_stop ≤ 15%, session_end = 0%
+  - **Realised round-trip cost**: < 1.8 pip (= 2× backtest baseline of 0.9 pip)
+- **Fail** if any of the above is out of envelope. Strategy is doing
+  something meaningfully different live than the backtest models.
+
+Note: the original 2–6 bar pass band in an earlier draft of this spec
+was based on the *with-session-close* baseline. That baseline was
+falsified by Test 1; the no-session-close envelope above replaces it
+before any shadow data arrives, not after.
 
 ## Final gate after all three tests
 
