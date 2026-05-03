@@ -27,7 +27,19 @@ from .config import settings
 from .models import Candle, Side, Signal
 
 
-PIP = 0.0001  # EUR/USD
+# Default pip size for the configured instrument. Use pip_size(instrument)
+# at call sites to support JPY pairs (pip = 0.01) without changing callers.
+PIP = 0.0001  # legacy alias, EUR/USD style
+
+
+def pip_size(instrument: str) -> float:
+    """Return one pip in price units for the given instrument."""
+    return 0.01 if "JPY" in instrument else 0.0001
+
+
+def is_jpy_quote(instrument: str) -> bool:
+    """True if the quote currency is JPY (e.g. USD_JPY, EUR_JPY)."""
+    return instrument.endswith("_JPY")
 
 
 # --- indicators ----------------------------------------------------------
@@ -105,16 +117,31 @@ def position_size(
     entry: float,
     stop: float,
     max_leverage: float = 30.0,
+    instrument: Optional[str] = None,
 ) -> tuple[int, bool]:
     """Return (units, leverage_capped). units >= 0.
-    EUR/USD with USD account: 1 unit = 1 EUR; entry is USD/EUR.
+
+    USD account assumed. Two cases:
+      - quote = USD (e.g. EUR_USD): 1 unit = 1 EUR; P&L in USD = units × Δprice.
+        size: units = risk_$ / |entry - stop|; leverage cap: units × entry ≤ L × equity.
+      - quote = JPY (e.g. USD_JPY): 1 unit = 1 USD; P&L in JPY = units × Δprice;
+        ≈ converted by /entry. So |entry - stop| / entry ≈ % change ≈ USD-risk per
+        unit. size: units = risk_$ × entry / |entry - stop|; notional in USD = units;
+        leverage cap: units ≤ L × equity.
     """
+    inst = instrument or settings.INSTRUMENT
     risk_dollars = equity * (settings.RISK_PER_TRADE_PCT / 100.0)
     distance = abs(entry - stop)
     if distance <= 0 or entry <= 0:
         return 0, False
-    risk_units = int(risk_dollars / distance)
-    max_units = int(max_leverage * equity / entry)
+
+    if is_jpy_quote(inst):
+        risk_units = int(risk_dollars * entry / distance)
+        max_units = int(max_leverage * equity)
+    else:
+        risk_units = int(risk_dollars / distance)
+        max_units = int(max_leverage * equity / entry)
+
     if risk_units > max_units:
         return max_units, True
     return max(risk_units, 0), False
@@ -155,12 +182,13 @@ def evaluate(
     if np.isnan(a):
         return skip("warmup")
 
-    atr_pips = a * 10000.0
+    pip = pip_size(settings.INSTRUMENT)
+    atr_pips = a / pip
     if atr_pips < p.min_atr_pips:
         return skip("atr_below_min")
 
     stop_distance = p.stop_atr_mult * a
-    if stop_distance < p.min_stop_pips * PIP:
+    if stop_distance < p.min_stop_pips * pip:
         return skip("stop_below_min")
 
     n = p.donchian_period

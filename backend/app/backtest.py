@@ -38,11 +38,12 @@ import numpy as np
 from .config import settings
 from .models import BacktestResult, Candle, Side
 from .strategy import (
-    PIP,
     StrategyParams,
     StrategyState,
     evaluate,
     in_session,
+    is_jpy_quote,
+    pip_size,
     position_size,
 )
 
@@ -83,7 +84,7 @@ def _apply_costs(
     slippage_pips: float,
 ) -> float:
     """Add round-trip half-spread + slippage to the trader's detriment."""
-    cost = (spread_pips / 2.0 + slippage_pips) * PIP
+    cost = (spread_pips / 2.0 + slippage_pips) * pip_size(settings.INSTRUMENT)
     if action == "entry":
         return price + cost if side == Side.LONG else price - cost
     return price - cost if side == Side.LONG else price + cost
@@ -264,10 +265,16 @@ def _close_trade(
     initial_stop = open_trade["initial_stop"]
     final_stop = open_trade["stop"]
     if side == Side.LONG:
-        gross = (exit_price - entry_px) * units
+        gross_quote = (exit_price - entry_px) * units
     else:
-        gross = (entry_px - exit_price) * units
-    planned_risk = abs(entry_px - initial_stop) * units
+        gross_quote = (entry_px - exit_price) * units
+    # Convert to USD if quote currency is JPY (account currency is USD).
+    if is_jpy_quote(settings.INSTRUMENT):
+        gross = gross_quote / exit_price
+        planned_risk = abs(entry_px - initial_stop) * units / entry_px
+    else:
+        gross = gross_quote
+        planned_risk = abs(entry_px - initial_stop) * units
     r_mult = gross / planned_risk if planned_risk > 0 else 0.0
     pnl_pct = 100.0 * gross / open_trade["equity_at_entry"]
     new_equity = equity + gross
@@ -377,8 +384,9 @@ def _diagnostics_dict(
 
     # Friction tax metric: round-trip cost as % of initial stop distance.
     cost_pips_round_trip = spread_pips + 2.0 * slippage_pips
+    pip_units = pip_size(settings.INSTRUMENT)
     stop_dists_pips = [
-        abs(t.entry_price - t.initial_stop) * 10000.0 for t in trades
+        abs(t.entry_price - t.initial_stop) / pip_units for t in trades
     ]
     avg_stop_pips = float(np.mean(stop_dists_pips)) if stop_dists_pips else 0.0
     if stop_dists_pips:
