@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS trades (
     initial_stop REAL,
     atr_at_entry REAL,
     trailed INTEGER NOT NULL DEFAULT 0,
+    is_shadow INTEGER NOT NULL DEFAULT 0,
     exit_time TEXT,
     exit_price REAL,
     pnl REAL,
@@ -97,8 +98,9 @@ class TradeLog:
                 """INSERT INTO trades
                    (oanda_trade_id, instrument, side, units, entry_time,
                     entry_price, stop_price, target_price,
-                    initial_stop, atr_at_entry, trailed, status, reason)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    initial_stop, atr_at_entry, trailed, is_shadow,
+                    status, reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     t.oanda_trade_id,
                     t.instrument,
@@ -111,6 +113,7 @@ class TradeLog:
                     t.initial_stop,
                     t.atr_at_entry,
                     1 if t.trailed else 0,
+                    1 if t.is_shadow else 0,
                     t.status.value,
                     t.reason,
                 ),
@@ -195,6 +198,7 @@ class TradeLog:
             initial_stop=col("initial_stop"),
             atr_at_entry=col("atr_at_entry"),
             trailed=bool(col("trailed", 0) or 0),
+            is_shadow=bool(col("is_shadow", 0) or 0),
             exit_time=_from_iso(r["exit_time"]),
             exit_price=r["exit_price"],
             pnl=r["pnl"],

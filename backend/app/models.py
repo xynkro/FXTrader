@@ -53,6 +53,7 @@ class Trade(BaseModel):
     initial_stop: Optional[float] = None  # stop set at entry; never changes
     atr_at_entry: Optional[float] = None  # frozen ATR — drives trail distance
     trailed: bool = False                 # has the trail moved at least once?
+    is_shadow: bool = False               # True = hypothetical, no broker order
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     pnl: Optional[float] = None        # realised, in account currency

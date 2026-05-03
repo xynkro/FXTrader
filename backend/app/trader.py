@@ -28,8 +28,8 @@ from .models import EngineStatus, Side, Trade, TradeStatus
 from .oanda_client import OandaClient, OandaError, get_client
 from .risk import risk
 from .strategy import (
+    STRATEGIES,
     StrategyState,
-    evaluate,
     in_session,
     is_jpy_quote,
     pip_size,
@@ -50,6 +50,13 @@ class Engine:
         self._oanda_id_to_local: dict[str, int] = {}
         self._client: Optional[OandaClient] = None
         self._equity: float = 0.0
+        # Pending trail updates per shadow trade (active next bar).
+        self._shadow_pending_stops: dict[int, float] = {}
+
+    @property
+    def evaluate_fn(self):
+        name = settings.STRATEGY_NAME or "donchian"
+        return STRATEGIES.get(name, STRATEGIES["donchian"])
 
     @property
     def client(self) -> OandaClient:
@@ -94,8 +101,10 @@ class Engine:
 
         await self._reconcile_closures()
 
-        # Trail-stop update on every new bar close (parity with backtest).
+        # Per-bar shadow lifecycle (stop-out check, trail update) runs
+        # before signal evaluation.
         if new_bar:
+            await self._advance_shadow_trades_on_new_bars()
             await self._update_trail_stops()
 
         if not new_bar:
@@ -110,7 +119,7 @@ class Engine:
         if block:
             return
 
-        sig = evaluate(self.state, snap.equity)
+        sig = self.evaluate_fn(self.state, snap.equity)
         if sig is None:
             return
         self.last_signal_time = sig.time
@@ -149,41 +158,57 @@ class Engine:
             spread_at_signal / pip if spread_at_signal is not None else None
         )
 
-        # Initial stop is fixed at entry ± K*ATR. Engine handles trail manually.
-        try:
-            resp = await self.client.market_order(
-                instrument=settings.INSTRUMENT,
-                units=signed_units,
-                stop_price=sig.stop,
-                target_price=sig.target,   # None for trend follower
+        if settings.SHADOW_MODE:
+            # Synthesize a fill at the appropriate side of the live spread
+            # plus a slippage assumption that mirrors the backtest model
+            # (0.2 pip detrimental). No broker order is placed.
+            if bid_at_signal is None or ask_at_signal is None:
+                trade_log.log_event(
+                    "WARN", "shadow_skip_no_quote",
+                    "no current price available; skipping shadow signal",
+                )
+                return
+            base = ask_at_signal if sig.side == Side.LONG else bid_at_signal
+            slip_assumed = 0.2 * pip
+            fill_price = (
+                base + slip_assumed if sig.side == Side.LONG
+                else base - slip_assumed
             )
-        except OandaError as e:
-            trade_log.log_event("ERROR", "order_failed", str(e))
-            risk.trip(f"order_failed:{e}")
-            return
+            oanda_trade_id = None
+            oanda_stop_price: Optional[float] = sig.stop
+            rounding = 0.0
+        else:
+            try:
+                resp = await self.client.market_order(
+                    instrument=settings.INSTRUMENT,
+                    units=signed_units,
+                    stop_price=sig.stop,
+                    target_price=sig.target,
+                )
+            except OandaError as e:
+                trade_log.log_event("ERROR", "order_failed", str(e))
+                risk.trip(f"order_failed:{e}")
+                return
 
-        fill = resp.get("orderFillTransaction", {})
-        oanda_trade_id = fill.get("tradeOpened", {}).get("tradeID")
-        fill_price = float(fill.get("price", sig.entry))
+            fill = resp.get("orderFillTransaction", {})
+            oanda_trade_id = fill.get("tradeOpened", {}).get("tradeID")
+            fill_price = float(fill.get("price", sig.entry))
+
+            slot = resp.get("stopLossOrderTransaction") or {}
+            oanda_stop_price = None
+            if slot:
+                try:
+                    oanda_stop_price = float(slot.get("price"))
+                except (TypeError, ValueError):
+                    oanda_stop_price = None
+            rounding = (
+                abs(oanda_stop_price - sig.stop)
+                if oanda_stop_price is not None else 0.0
+            )
 
         # Slippage = actual fill vs signal-time mid.
         slippage_price = abs(fill_price - mid_at_signal) if mid_at_signal else 0.0
         slippage_pips = slippage_price / pip
-
-        # Stop placed by OANDA may differ from requested due to precision rules.
-        oanda_stop_price: Optional[float] = None
-        for tx in resp.get("relatedTransactionIDs", []):
-            pass  # not parsed; we rely on stopLossOrderTransaction below
-        slot = resp.get("stopLossOrderTransaction") or {}
-        if slot:
-            try:
-                oanda_stop_price = float(slot.get("price"))
-            except (TypeError, ValueError):
-                oanda_stop_price = None
-        rounding = (
-            abs(oanda_stop_price - sig.stop)
-            if oanda_stop_price is not None else 0.0
-        )
 
         # Record the trade with full provenance for trail logic + audit.
         local_trade = Trade(
@@ -197,6 +222,7 @@ class Engine:
             initial_stop=sig.stop,
             atr_at_entry=sig.atr,
             trailed=False,
+            is_shadow=bool(settings.SHADOW_MODE),
             target_price=sig.target,
             status=TradeStatus.OPEN,
             reason=sig.reason,
@@ -206,29 +232,22 @@ class Engine:
             self._oanda_id_to_local[oanda_trade_id] = trade_id
 
         # Single, audit-grade entry log line (kill criteria depend on this).
+        kind = "shadow" if settings.SHADOW_MODE else "live"
+        sp = f"{spread_pips:.2f}" if spread_pips is not None else "NA"
         trade_log.log_event(
             "INFO", "trade_opened",
-            (
-                f"id={trade_id} oanda={oanda_trade_id} "
-                f"side={sig.side.value} units={units} "
-                f"sig_entry={sig.entry:.5f} fill={fill_price:.5f} "
-                f"bid={bid_at_signal} ask={ask_at_signal} "
-                f"spread_pips={spread_pips:.2f} "
-                if spread_pips is not None else
-                f"id={trade_id} oanda={oanda_trade_id} "
-                f"side={sig.side.value} units={units} "
-                f"sig_entry={sig.entry:.5f} fill={fill_price:.5f} "
-                f"bid={bid_at_signal} ask={ask_at_signal} "
-                f"spread_pips=NA "
-            )
-            + (
-                f"slippage_pips={slippage_pips:.2f} assumed_slip_pips=0.20 "
-                f"initial_stop_req={sig.stop:.5f} "
-                f"initial_stop_oanda={oanda_stop_price} "
-                f"stop_rounding={rounding:.5f} "
-                f"stop_distance={sig.stop_distance:.5f} "
-                f"atr={sig.atr:.5f} reason={sig.reason}"
-            ),
+            f"[{kind}] id={trade_id} oanda={oanda_trade_id} "
+            f"side={sig.side.value} units={units} "
+            f"sig_entry={sig.entry:.5f} fill={fill_price:.5f} "
+            f"bid={bid_at_signal} ask={ask_at_signal} "
+            f"spread_pips={sp} "
+            f"slippage_pips={slippage_pips:.2f} assumed_slip_pips=0.20 "
+            f"initial_stop_req={sig.stop:.5f} "
+            f"initial_stop_active={oanda_stop_price} "
+            f"stop_rounding={rounding:.5f} "
+            f"stop_distance={sig.stop_distance:.5f} "
+            f"atr={sig.atr:.5f} strategy={settings.STRATEGY_NAME} "
+            f"reason={sig.reason}",
         )
 
     # ------------------------------------------------------------------
@@ -259,6 +278,19 @@ class Engine:
                     await self._push_trail(t, new_trail, ext)
 
     async def _push_trail(self, t: Trade, new_stop: float, ext: float) -> None:
+        pip = pip_size(settings.INSTRUMENT)
+        if t.is_shadow:
+            # Activate at NEXT bar (parity with backtest's delayed activation).
+            self._shadow_pending_stops[t.id] = new_stop
+            trade_log.log_event(
+                "INFO", "trail_update_pending",
+                f"[shadow] id={t.id} side={t.side.value} "
+                f"prev_stop={t.stop_price:.5f} pending_new_stop={new_stop:.5f} "
+                f"ext={ext:.5f} "
+                f"tighter_by_pips={(abs(new_stop - t.stop_price) / pip):.2f}",
+            )
+            return
+
         if t.oanda_trade_id is None:
             return
         try:
@@ -270,18 +302,88 @@ class Engine:
             )
             return
         trade_log.update_trade_stop(t.id, new_stop, trailed=True)
-        pip = pip_size(settings.INSTRUMENT)
         trade_log.log_event(
             "INFO", "trail_update",
-            f"id={t.id} oanda={t.oanda_trade_id} side={t.side.value} "
+            f"[live] id={t.id} oanda={t.oanda_trade_id} side={t.side.value} "
             f"prev_stop={t.stop_price:.5f} new_stop={new_stop:.5f} "
             f"ext={ext:.5f} tighter_by_pips={(abs(new_stop - t.stop_price) / pip):.2f}",
         )
 
     # ------------------------------------------------------------------
+    async def _advance_shadow_trades_on_new_bars(self) -> None:
+        """For each closed bar that hasn't been processed for shadow trades,
+        (1) activate any pending trail update from the prior bar,
+        (2) check stop-out using the bar's full range,
+        (3) close the trade if hit."""
+        candles = list(self.state.candles)
+        for t in trade_log.open_trades():
+            if not t.is_shadow:
+                continue
+            held = [c for c in candles if c.time > t.entry_time]
+            if not held:
+                continue
+
+            # The "newest" bar is the trail-update activation moment.
+            # We process bars in chronological order to avoid skipping a
+            # stop-out that occurred before a later trail tightening.
+            for bar in held:
+                # 1. Activate pending stop (computed at end of previous bar)
+                if t.id in self._shadow_pending_stops:
+                    new_stop = self._shadow_pending_stops.pop(t.id)
+                    trade_log.update_trade_stop(t.id, new_stop, trailed=True)
+                    t.stop_price = new_stop
+                    t.trailed = True
+
+                # 2. Stop-out check
+                stop_hit = (
+                    bar.low <= t.stop_price if t.side == Side.LONG
+                    else bar.high >= t.stop_price
+                )
+                if stop_hit:
+                    await self._close_shadow_trade(t, t.stop_price, bar.time)
+                    break  # done with this trade
+
+    async def _close_shadow_trade(
+        self, t: Trade, exit_price: float, exit_time: datetime
+    ) -> None:
+        # P&L conversion (same as live) — shadow uses the stop-fill price.
+        if is_jpy_quote(t.instrument):
+            if t.side == Side.LONG:
+                gross = ((exit_price - t.entry_price) * abs(t.units)) / exit_price
+            else:
+                gross = ((t.entry_price - exit_price) * abs(t.units)) / exit_price
+            planned_risk = (
+                abs(t.entry_price - (t.initial_stop or t.stop_price))
+                * abs(t.units) / t.entry_price
+            )
+        else:
+            if t.side == Side.LONG:
+                gross = (exit_price - t.entry_price) * abs(t.units)
+            else:
+                gross = (t.entry_price - exit_price) * abs(t.units)
+            planned_risk = (
+                abs(t.entry_price - (t.initial_stop or t.stop_price))
+                * abs(t.units)
+            )
+        pnl_pct = 100.0 * gross / self._equity if self._equity > 0 else 0.0
+        r = gross / planned_risk if planned_risk > 0 else 0.0
+        trade_log.close_trade(
+            trade_id=t.id, exit_time=exit_time, exit_price=exit_price,
+            pnl=gross, pnl_pct=pnl_pct, r_multiple=r,
+        )
+        exit_label = "trailing_stop" if t.trailed else "initial_stop"
+        trade_log.log_event(
+            "INFO", "trade_closed",
+            f"[shadow] id={t.id} side={t.side.value} "
+            f"exit_price={exit_price:.5f} pnl=${gross:.2f} "
+            f"pnl_pct={pnl_pct:+.3f}% R={r:+.2f} exit_type={exit_label}",
+        )
+
+    # ------------------------------------------------------------------
     async def _reconcile_closures(self) -> None:
-        """Any local OPEN trade not in OANDA's open list = closed. Pull the
-        fill price from current price and mark closed."""
+        """Any local OPEN live trade not in OANDA's open list = closed.
+        Shadow trades are excluded (their lifecycle is handled by
+        _advance_shadow_trades_on_new_bars)."""
         try:
             oanda_open = await self.client.open_trades()
         except OandaError:
@@ -289,6 +391,8 @@ class Engine:
         oanda_open_ids = {t["id"] for t in oanda_open}
 
         for t in trade_log.open_trades():
+            if t.is_shadow:
+                continue
             if t.oanda_trade_id and t.oanda_trade_id not in oanda_open_ids:
                 bid, ask = await self.client.current_price(t.instrument)
                 exit_price = bid if t.side == Side.LONG else ask

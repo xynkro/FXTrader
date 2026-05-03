@@ -143,6 +143,9 @@ def main() -> int:
     ap.add_argument("--strategy", choices=sorted(STRATEGIES.keys()),
                     default="donchian",
                     help="Which entry logic to test (default: donchian)")
+    ap.add_argument("--no-session-close", action="store_true",
+                    help="Disable forced exit at session end (Test 1 of "
+                         "robustness pack — let trades hold across sessions)")
     args = ap.parse_args()
 
     if args.instrument:
@@ -174,17 +177,20 @@ def main() -> int:
         is_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
         evaluate_fn=eval_fn,
+        force_close_at_session_end=not args.no_session_close,
     )
     oos_result, oos_trades, oos_eq, oos_diag = run_backtest(
         oos_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
         evaluate_fn=eval_fn,
+        force_close_at_session_end=not args.no_session_close,
     )
     fr_result, fr_trades, fr_eq, fr_diag = run_backtest(
         candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=2.0 * args.spread_pips,
         slippage_pips=2.0 * args.slippage_pips,
         evaluate_fn=eval_fn,
+        force_close_at_session_end=not args.no_session_close,
     )
 
     save_results(is_result, is_trades, is_eq, is_diag, label=f"{args.label}_IS")

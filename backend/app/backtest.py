@@ -98,7 +98,8 @@ def run_backtest(
     params: Optional[StrategyParams] = None,
     spread_pips: float = 0.5,
     slippage_pips: float = 0.2,
-    session_filter: bool = True,
+    signal_in_session_only: bool = True,
+    force_close_at_session_end: bool = True,
     evaluate_fn: Optional[Callable] = None,
 ) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]], dict]:
     if not candles:
@@ -150,7 +151,7 @@ def run_backtest(
         # --- 3. Activate pending entry at this bar's open ---
         if open_trade is None and pending_signal is not None:
             sig = pending_signal
-            if session_filter and not in_session(bar.time):
+            if signal_in_session_only and not in_session(bar.time):
                 # next bar after a session-edge signal → discard
                 pending_signal = None
             else:
@@ -200,7 +201,7 @@ def run_backtest(
         if (
             open_trade is not None
             and not exited_by_stop
-            and session_filter
+            and force_close_at_session_end
             and not in_session(bar.time)
         ):
             side = open_trade["side"]
@@ -222,7 +223,7 @@ def run_backtest(
         if (
             open_trade is None
             and pending_signal is None
-            and (not session_filter or in_session(bar.time))
+            and (not signal_in_session_only or in_session(bar.time))
         ):
             sig = eval_fn(state, equity, diagnostics=diag.skips)
             if sig is not None:

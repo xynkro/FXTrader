@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     SESSION_END_UTC: str = "16:00"
 
     TRADING_ENABLED: bool = False
+    SHADOW_MODE: bool = False               # if True: simulate fills locally, skip broker
+    STRATEGY_NAME: str = "donchian"         # one of: donchian, pullback, volsqueeze
 
     BACKEND_HOST: str = "127.0.0.1"
     BACKEND_PORT: int = 8765
