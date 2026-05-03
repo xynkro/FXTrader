@@ -92,13 +92,18 @@ class Engine:
             return
         self.last_signal_time = sig.time
 
-        units = position_size(snap.equity, sig.entry, sig.stop)
+        units, leverage_capped = position_size(snap.equity, sig.entry, sig.stop)
         if units <= 0:
             trade_log.log_event(
                 "WARN", "size_zero",
                 f"computed 0 units for entry={sig.entry} stop={sig.stop}",
             )
             return
+        if leverage_capped:
+            trade_log.log_event(
+                "WARN", "leverage_capped",
+                f"units capped to {units} on entry={sig.entry}",
+            )
         signed_units = units if sig.side == Side.LONG else -units
 
         try:
@@ -106,7 +111,7 @@ class Engine:
                 instrument=settings.INSTRUMENT,
                 units=signed_units,
                 stop_price=sig.stop,
-                target_price=sig.target,
+                target_price=sig.target,   # may be None for trend follower
             )
         except OandaError as e:
             trade_log.log_event("ERROR", "order_failed", str(e))
@@ -125,18 +130,19 @@ class Engine:
             entry_time=sig.time,
             entry_price=fill_price,
             stop_price=sig.stop,
-            target_price=sig.target,
+            target_price=sig.target if sig.target is not None else 0.0,
             status=TradeStatus.OPEN,
             reason=sig.reason,
         )
         trade_id = trade_log.insert_trade(local_trade)
         if oanda_trade_id:
             self._oanda_id_to_local[oanda_trade_id] = trade_id
+        tgt_str = f"{sig.target:.5f}" if sig.target is not None else "trail"
         trade_log.log_event(
             "INFO",
             "trade_opened",
             f"#{trade_id} {sig.side.value} {units}u @ {fill_price:.5f} "
-            f"stop={sig.stop:.5f} tgt={sig.target:.5f}",
+            f"stop={sig.stop:.5f} tgt={tgt_str}",
         )
 
     # ------------------------------------------------------------------

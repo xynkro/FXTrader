@@ -32,10 +32,11 @@ class Candle(BaseModel):
 class Signal(BaseModel):
     time: datetime
     side: Side
-    entry: float
-    stop: float
-    target: float
-    atr: float
+    entry: float           # estimate (signal-bar close); backtest fills at t+1 open
+    stop: float            # estimate (entry ± K*ATR); backtest recomputes from t+1 fill
+    target: Optional[float] = None       # None for trend follower
+    atr: float                            # frozen at signal bar
+    stop_distance: float = 0.0            # K * ATR in price units (used by backtest)
     reason: str
 
 

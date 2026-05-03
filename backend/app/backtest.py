@@ -1,21 +1,34 @@
-"""Bar-by-bar backtester. Conservative fill assumptions:
+"""Bar-by-bar backtester for v1-B trend-follower with strict execution semantics.
 
-  - Entry fills at signal candle close + 0.2 pip slippage on the trade direction
-  - Spread cost: 0.5 pip charged on each entry (round-trip ≈ 1 pip)
-  - If both stop and target are touched in the same later bar, assume STOP
-    fills first (worst case — we have no tick data to disambiguate)
-  - Position size scales with current equity using the same formula as live
+Locked semantics (verified against the v1-B plan):
 
-Outputs:
-  - List of completed trade dicts
-  - Equity curve (per closed trade)
-  - Aggregate stats: win rate, avg R, expectancy, Sharpe, max DD, profit factor
+1. Signal computed on close of bar t. Entry filled at OPEN of bar t+1 with
+   spread/slippage applied. Stop computed from t+1 fill price using
+   ATR FROZEN at signal bar (sig.atr).
+
+2. Stop-out check uses the stop active for that bar (set at end of previous
+   bar). Trail update for bar t becomes active at bar t+1 — never
+   retroactively protects bar t. (No lookahead.)
+
+3. Cooldown applies after stop-out only (initial OR trailed). NOT after
+   session-end forced exit.
+
+4. Session-end exit: if open trade and current bar is OOS, close at this
+   bar's open with costs (the boundary bar = "17:00 close" mark).
+
+5. Sizing safeguards:
+   - MIN_STOP_PIPS already filtered at signal time (in strategy.evaluate)
+   - MAX_LEVERAGE caps units; counted as `leverage_cap_binds`
+
+Reports: per-trade list w/ bars_held, equity curve, skip counts, monthly P&L,
+top-5 winner concentration, friction shock (via spread/slippage args).
 """
 from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,17 +38,13 @@ import numpy as np
 from .config import settings
 from .models import BacktestResult, Candle, Side
 from .strategy import (
+    PIP,
     StrategyParams,
     StrategyState,
     evaluate,
     in_session,
     position_size,
 )
-
-
-SPREAD_PIPS = 0.5            # one-side spread cost; round-trip ≈ 1 pip
-SLIPPAGE_PIPS = 0.2
-PIP = 0.0001                 # EUR/USD
 
 
 @dataclass
@@ -46,23 +55,37 @@ class BTTrade:
     units: int
     entry_price: float
     exit_price: float
-    stop_price: float
-    target_price: float
+    initial_stop: float
+    final_stop: float
+    atr_at_entry: float
     pnl: float
     pnl_pct: float
     r_multiple: float
     bars_held: int
+    leverage_capped: bool
     exit_reason: str
     reason: str
 
 
-def _apply_costs(side: Side, price: float, action: str) -> float:
-    """`action` is 'entry' or 'exit'. We apply spread + slippage to the
-    detriment of the trader."""
-    cost = (SPREAD_PIPS / 2 + SLIPPAGE_PIPS) * PIP
+@dataclass
+class BTDiagnostics:
+    leverage_cap_attempts: int = 0
+    leverage_cap_binds: int = 0
+    session_end_closes: int = 0
+    skips: dict = field(default_factory=dict)
+
+
+def _apply_costs(
+    side: Side,
+    price: float,
+    action: str,
+    spread_pips: float,
+    slippage_pips: float,
+) -> float:
+    """Add round-trip half-spread + slippage to the trader's detriment."""
+    cost = (spread_pips / 2.0 + slippage_pips) * PIP
     if action == "entry":
         return price + cost if side == Side.LONG else price - cost
-    # exit
     return price - cost if side == Side.LONG else price + cost
 
 
@@ -70,159 +93,200 @@ def run_backtest(
     candles: list[Candle],
     starting_equity: float = 10_000.0,
     params: Optional[StrategyParams] = None,
+    spread_pips: float = 0.5,
+    slippage_pips: float = 0.2,
     session_filter: bool = True,
-    end_of_session_close: bool = True,
-) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]]]:
+) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]], dict]:
     if not candles:
         raise ValueError("no candles supplied")
 
-    state = StrategyState(params=params or StrategyParams())
-    equity = starting_equity
-    peak = equity
+    p = params or StrategyParams()
+    state = StrategyState(params=p)
+    diag = BTDiagnostics()
     trades: list[BTTrade] = []
     equity_curve: list[tuple[str, float]] = [
-        (candles[0].time.isoformat(), equity)
+        (candles[0].time.isoformat(), starting_equity)
     ]
+    equity = starting_equity
 
+    pending_signal = None
     open_trade: Optional[dict] = None
-    bars_held = 0
 
-    for i, bar in enumerate(candles):
-        # 1) If we're in a trade, check for stop/target hit on THIS bar
+    for bar in candles:
+        # --- 1. Activate any trail update planned for this bar ---
+        if open_trade is not None and open_trade.get("next_stop") is not None:
+            open_trade["stop"] = open_trade["next_stop"]
+            open_trade["next_stop"] = None
+
+        # --- 2. Stop-out check using the active stop ---
+        exited_by_stop = False
         if open_trade is not None:
-            bars_held += 1
             side = open_trade["side"]
             stop = open_trade["stop"]
-            target = open_trade["target"]
-
             stop_hit = (
                 bar.low <= stop if side == Side.LONG else bar.high >= stop
             )
-            target_hit = (
-                bar.high >= target if side == Side.LONG else bar.low <= target
-            )
-
-            exit_reason = None
-            if stop_hit and target_hit:
-                # Worst case: assume stop first
-                fill = stop
-                exit_reason = "stop_first_ambiguous"
-            elif stop_hit:
-                fill = stop
-                exit_reason = "stop"
-            elif target_hit:
-                fill = target
-                exit_reason = "target"
-
-            # End-of-session timed close
-            if (
-                exit_reason is None
-                and end_of_session_close
-                and session_filter
-                and not in_session(bar.time)
-                and i > 0
-                and in_session(candles[i - 1].time)
-            ):
-                fill = bar.open
-                exit_reason = "session_end"
-
-            if exit_reason is not None:
-                exit_price = _apply_costs(side, fill, "exit")
-                entry_px = open_trade["entry_price"]
-                units = open_trade["units"]
-                gross = (
-                    (exit_price - entry_px) * units
-                    if side == Side.LONG
-                    else (entry_px - exit_price) * units
+            if stop_hit:
+                exit_price = _apply_costs(
+                    side, stop, "exit", spread_pips, slippage_pips
                 )
-                planned_risk = abs(entry_px - open_trade["stop"]) * units
-                r_mult = gross / planned_risk if planned_risk > 0 else 0.0
-                pnl_pct = 100.0 * gross / open_trade["equity_at_entry"]
-                equity += gross
-                peak = max(peak, equity)
-
-                trades.append(
-                    BTTrade(
-                        entry_time=open_trade["entry_time"].isoformat(),
-                        exit_time=bar.time.isoformat(),
-                        side=side.value,
-                        units=units,
-                        entry_price=entry_px,
-                        exit_price=exit_price,
-                        stop_price=open_trade["stop"],
-                        target_price=open_trade["target"],
-                        pnl=gross,
-                        pnl_pct=pnl_pct,
-                        r_multiple=r_mult,
-                        bars_held=bars_held,
-                        exit_reason=exit_reason,
-                        reason=open_trade["reason"],
-                    )
+                equity = _close_trade(
+                    open_trade, exit_price, bar.time, "stop",
+                    trades, equity_curve, equity,
                 )
-                equity_curve.append((bar.time.isoformat(), equity))
+                state.trip_cooldown(side)   # cooldown ONLY after stop-out
                 open_trade = None
-                bars_held = 0
+                exited_by_stop = True
 
-        # 2) Always update strategy state with this bar
+        # --- 3. Activate pending entry at this bar's open ---
+        if open_trade is None and pending_signal is not None:
+            sig = pending_signal
+            if session_filter and not in_session(bar.time):
+                # next bar after a session-edge signal → discard
+                pending_signal = None
+            else:
+                fill_price = _apply_costs(
+                    sig.side, bar.open, "entry", spread_pips, slippage_pips
+                )
+                stop_distance = sig.stop_distance
+                # Recompute stop from actual fill (locked semantic)
+                if sig.side == Side.LONG:
+                    initial_stop = fill_price - stop_distance
+                else:
+                    initial_stop = fill_price + stop_distance
+                units, capped = position_size(
+                    equity, fill_price, initial_stop, p.max_leverage
+                )
+                diag.leverage_cap_attempts += 1
+                if capped:
+                    diag.leverage_cap_binds += 1
+                if units > 0:
+                    open_trade = {
+                        "side": sig.side,
+                        "entry_time": bar.time,
+                        "entry_price": fill_price,
+                        "initial_stop": initial_stop,
+                        "stop": initial_stop,
+                        "next_stop": None,
+                        "atr_at_entry": sig.atr,
+                        "stop_distance": stop_distance,
+                        "units": units,
+                        "leverage_capped": capped,
+                        "equity_at_entry": equity,
+                        "ext": bar.high if sig.side == Side.LONG else bar.low,
+                        "bars_held": 0,
+                        "reason": sig.reason,
+                    }
+                pending_signal = None
+
+        # --- 4. Update trail extreme + bars_held ---
+        if open_trade is not None:
+            if open_trade["side"] == Side.LONG:
+                open_trade["ext"] = max(open_trade["ext"], bar.high)
+            else:
+                open_trade["ext"] = min(open_trade["ext"], bar.low)
+            open_trade["bars_held"] += 1
+
+        # --- 5. Session-end forced exit (no cooldown) ---
+        if (
+            open_trade is not None
+            and not exited_by_stop
+            and session_filter
+            and not in_session(bar.time)
+        ):
+            side = open_trade["side"]
+            exit_price = _apply_costs(
+                side, bar.open, "exit", spread_pips, slippage_pips
+            )
+            equity = _close_trade(
+                open_trade, exit_price, bar.time, "session_end",
+                trades, equity_curve, equity,
+            )
+            diag.session_end_closes += 1
+            open_trade = None
+
+        # --- 6. Add bar to strategy state, decrement cooldowns ---
         state.add(bar)
+        state.decrement_cooldowns()
 
-        # 3) Evaluate for new signal (only if flat)
-        if open_trade is None:
-            sig = evaluate(state, equity)
-            if sig is None:
-                continue
-            entry_px = _apply_costs(sig.side, sig.entry, "entry")
-            units = position_size(equity, entry_px, sig.stop)
-            if units <= 0:
-                continue
-            open_trade = {
-                "side": sig.side,
-                "entry_time": sig.time,
-                "entry_price": entry_px,
-                "stop": sig.stop,
-                "target": sig.target,
-                "units": units,
-                "equity_at_entry": equity,
-                "reason": sig.reason,
-            }
-            bars_held = 0
+        # --- 7. Evaluate signal if flat AND in-session AND no pending ---
+        if (
+            open_trade is None
+            and pending_signal is None
+            and (not session_filter or in_session(bar.time))
+        ):
+            sig = evaluate(state, equity, diagnostics=diag.skips)
+            if sig is not None:
+                pending_signal = sig
 
-    # Close any dangling trade at the last bar's close
+        # --- 8. Compute next-bar trail stop (active at bar t+1) ---
+        if open_trade is not None:
+            stop_dist = open_trade["stop_distance"]
+            ext = open_trade["ext"]
+            if open_trade["side"] == Side.LONG:
+                trail = ext - stop_dist
+                if trail > open_trade["stop"]:
+                    open_trade["next_stop"] = trail
+            else:
+                trail = ext + stop_dist
+                if trail < open_trade["stop"]:
+                    open_trade["next_stop"] = trail
+
+    # Close dangling trade at last bar's close
     if open_trade is not None:
         side = open_trade["side"]
-        exit_price = _apply_costs(side, candles[-1].close, "exit")
-        entry_px = open_trade["entry_price"]
-        units = open_trade["units"]
-        gross = (
-            (exit_price - entry_px) * units
-            if side == Side.LONG
-            else (entry_px - exit_price) * units
+        exit_price = _apply_costs(
+            side, candles[-1].close, "exit", spread_pips, slippage_pips
         )
-        planned_risk = abs(entry_px - open_trade["stop"]) * units
-        r_mult = gross / planned_risk if planned_risk > 0 else 0.0
-        pnl_pct = 100.0 * gross / open_trade["equity_at_entry"]
-        equity += gross
-        trades.append(
-            BTTrade(
-                entry_time=open_trade["entry_time"].isoformat(),
-                exit_time=candles[-1].time.isoformat(),
-                side=side.value,
-                units=units,
-                entry_price=entry_px,
-                exit_price=exit_price,
-                stop_price=open_trade["stop"],
-                target_price=open_trade["target"],
-                pnl=gross,
-                pnl_pct=pnl_pct,
-                r_multiple=r_mult,
-                bars_held=bars_held,
-                exit_reason="forced_eod",
-                reason=open_trade["reason"],
-            )
+        equity = _close_trade(
+            open_trade, exit_price, candles[-1].time, "forced_eod",
+            trades, equity_curve, equity,
         )
-        equity_curve.append((candles[-1].time.isoformat(), equity))
 
-    return _summarize(candles, trades, equity_curve, starting_equity, equity), trades, equity_curve
+    summary = _summarize(candles, trades, equity_curve, starting_equity, equity)
+    diagnostics = _diagnostics_dict(diag, trades)
+    return summary, trades, equity_curve, diagnostics
+
+
+def _close_trade(
+    open_trade: dict, exit_price: float, exit_time: datetime, reason: str,
+    trades: list[BTTrade], equity_curve: list[tuple[str, float]], equity: float,
+) -> float:
+    side = open_trade["side"]
+    units = open_trade["units"]
+    entry_px = open_trade["entry_price"]
+    initial_stop = open_trade["initial_stop"]
+    final_stop = open_trade["stop"]
+    if side == Side.LONG:
+        gross = (exit_price - entry_px) * units
+    else:
+        gross = (entry_px - exit_price) * units
+    planned_risk = abs(entry_px - initial_stop) * units
+    r_mult = gross / planned_risk if planned_risk > 0 else 0.0
+    pnl_pct = 100.0 * gross / open_trade["equity_at_entry"]
+    new_equity = equity + gross
+    trades.append(
+        BTTrade(
+            entry_time=open_trade["entry_time"].isoformat(),
+            exit_time=exit_time.isoformat(),
+            side=side.value,
+            units=units,
+            entry_price=entry_px,
+            exit_price=exit_price,
+            initial_stop=initial_stop,
+            final_stop=final_stop,
+            atr_at_entry=open_trade["atr_at_entry"],
+            pnl=gross,
+            pnl_pct=pnl_pct,
+            r_multiple=r_mult,
+            bars_held=open_trade["bars_held"],
+            leverage_capped=open_trade["leverage_capped"],
+            exit_reason=reason,
+            reason=open_trade["reason"],
+        )
+    )
+    equity_curve.append((exit_time.isoformat(), new_equity))
+    return new_equity
 
 
 def _summarize(
@@ -235,34 +299,30 @@ def _summarize(
     n = len(trades)
     if n == 0:
         return BacktestResult(
-            start=candles[0].time,
-            end=candles[-1].time,
-            instrument=settings.INSTRUMENT,
-            bars=len(candles),
-            trades=0, wins=0, losses=0,
-            win_rate=0.0, avg_r=0.0, expectancy_pct=0.0,
-            total_return_pct=0.0, max_drawdown_pct=0.0,
-            sharpe=0.0, profit_factor=0.0,
+            start=candles[0].time, end=candles[-1].time,
+            instrument=settings.INSTRUMENT, bars=len(candles),
+            trades=0, wins=0, losses=0, win_rate=0.0, avg_r=0.0,
+            expectancy_pct=0.0, total_return_pct=0.0,
+            max_drawdown_pct=0.0, sharpe=0.0, profit_factor=0.0,
             final_equity=final_equity, starting_equity=starting_equity,
         )
 
     pnls = np.array([t.pnl for t in trades])
-    rs = np.array([t.r_multiple for t in trades])
+    rs   = np.array([t.r_multiple for t in trades])
     pcts = np.array([t.pnl_pct for t in trades])
+
     wins = int((pnls > 0).sum())
     losses = int((pnls <= 0).sum())
     win_rate = 100.0 * wins / n
     avg_r = float(rs.mean())
     expectancy_pct = float(pcts.mean())
-    total_ret_pct = 100.0 * (final_equity - starting_equity) / starting_equity
+    total_ret = 100.0 * (final_equity - starting_equity) / starting_equity
 
-    # Max drawdown on equity curve
     eq = np.array([e for _, e in equity_curve])
     peaks = np.maximum.accumulate(eq)
     dd = (peaks - eq) / peaks
-    max_dd_pct = float(dd.max() * 100.0) if len(dd) else 0.0
+    max_dd = float(dd.max() * 100.0) if len(dd) else 0.0
 
-    # Sharpe on per-trade % returns, annualised by trades/year (conservative)
     days = max((candles[-1].time - candles[0].time).days, 1)
     trades_per_year = n * (365.0 / days)
     if pcts.std(ddof=0) > 0:
@@ -272,25 +332,60 @@ def _summarize(
 
     gross_win = float(pnls[pnls > 0].sum())
     gross_loss = float(-pnls[pnls < 0].sum())
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
 
     return BacktestResult(
-        start=candles[0].time,
-        end=candles[-1].time,
-        instrument=settings.INSTRUMENT,
-        bars=len(candles),
-        trades=n, wins=wins, losses=losses,
-        win_rate=win_rate, avg_r=avg_r, expectancy_pct=expectancy_pct,
-        total_return_pct=total_ret_pct, max_drawdown_pct=max_dd_pct,
-        sharpe=sharpe, profit_factor=profit_factor,
+        start=candles[0].time, end=candles[-1].time,
+        instrument=settings.INSTRUMENT, bars=len(candles),
+        trades=n, wins=wins, losses=losses, win_rate=win_rate,
+        avg_r=avg_r, expectancy_pct=expectancy_pct,
+        total_return_pct=total_ret, max_drawdown_pct=max_dd,
+        sharpe=sharpe, profit_factor=pf,
         final_equity=final_equity, starting_equity=starting_equity,
     )
+
+
+def _diagnostics_dict(diag: BTDiagnostics, trades: list[BTTrade]) -> dict:
+    durations = [t.bars_held for t in trades]
+    avg_dur = float(np.mean(durations)) if durations else 0.0
+    median_dur = float(np.median(durations)) if durations else 0.0
+
+    pnls_sorted = sorted([t.pnl for t in trades], reverse=True)
+    gross_profit = sum(p for p in pnls_sorted if p > 0)
+    top5_sum = sum(p for p in pnls_sorted[:5] if p > 0)
+    top5_pct = (100.0 * top5_sum / gross_profit) if gross_profit > 0 else 0.0
+
+    monthly: dict[str, float] = defaultdict(float)
+    for t in trades:
+        mo = datetime.fromisoformat(t.exit_time).strftime("%Y-%m")
+        monthly[mo] += t.pnl
+
+    exit_reasons: dict[str, int] = defaultdict(int)
+    for t in trades:
+        exit_reasons[t.exit_reason] += 1
+
+    return {
+        "session_end_closes": diag.session_end_closes,
+        "leverage_cap_attempts": diag.leverage_cap_attempts,
+        "leverage_cap_binds": diag.leverage_cap_binds,
+        "leverage_cap_pct": (
+            100.0 * diag.leverage_cap_binds / diag.leverage_cap_attempts
+            if diag.leverage_cap_attempts > 0 else 0.0
+        ),
+        "avg_bars_held": avg_dur,
+        "median_bars_held": median_dur,
+        "top5_winner_concentration_pct": top5_pct,
+        "monthly_pnl": dict(monthly),
+        "skips": dict(diag.skips),
+        "exit_reasons": dict(exit_reasons),
+    }
 
 
 def save_results(
     result: BacktestResult,
     trades: list[BTTrade],
     equity_curve: list[tuple[str, float]],
+    diagnostics: dict,
     out_dir: Optional[Path] = None,
     label: str = "default",
 ) -> Path:
@@ -299,7 +394,6 @@ def save_results(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     folder = out_dir / f"{stamp}_{label}"
     folder.mkdir()
-
     (folder / "summary.json").write_text(
         json.dumps(result.model_dump(mode="json"), indent=2, default=str)
     )
@@ -308,5 +402,8 @@ def save_results(
     )
     (folder / "equity.json").write_text(
         json.dumps([{"t": t, "equity": e} for t, e in equity_curve], indent=2)
+    )
+    (folder / "diagnostics.json").write_text(
+        json.dumps(diagnostics, indent=2, default=str)
     )
     return folder

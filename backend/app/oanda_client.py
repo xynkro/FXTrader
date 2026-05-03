@@ -137,20 +137,19 @@ class OandaClient:
         instrument: str,
         units: int,
         stop_price: float,
-        target_price: float,
+        target_price: Optional[float] = None,
     ) -> dict:
-        body = {
-            "order": {
-                "type": "MARKET",
-                "instrument": instrument,
-                "units": str(units),
-                "timeInForce": "FOK",
-                "positionFill": "DEFAULT",
-                "stopLossOnFill": {"price": f"{stop_price:.5f}"},
-                "takeProfitOnFill": {"price": f"{target_price:.5f}"},
-            }
+        order: dict = {
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": f"{stop_price:.5f}"},
         }
-        r = orders.OrderCreate(accountID=self.account_id, data=body)
+        if target_price is not None and target_price > 0:
+            order["takeProfitOnFill"] = {"price": f"{target_price:.5f}"}
+        r = orders.OrderCreate(accountID=self.account_id, data={"order": order})
         try:
             self.api.request(r)
         except V20Error as e:
@@ -158,7 +157,11 @@ class OandaClient:
         return r.response
 
     async def market_order(
-        self, instrument: str, units: int, stop_price: float, target_price: float
+        self,
+        instrument: str,
+        units: int,
+        stop_price: float,
+        target_price: Optional[float] = None,
     ) -> dict:
         return await asyncio.to_thread(
             self._market_order_sync, instrument, units, stop_price, target_price
