@@ -2,7 +2,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 
-export default defineConfig({
+// `base` differs between dev (root) and GH Pages (/FXTrader/).
+// In LAN mode (`npm run dev -- --host 0.0.0.0`), root is fine.
+export default defineConfig(({ command }) => ({
+  base: command === "build" ? "/FXTrader/" : "/",
   plugins: [
     react(),
     VitePWA({
@@ -29,6 +32,7 @@ export default defineConfig({
     }),
   ],
   server: {
+    host: "0.0.0.0",        // LAN-reachable
     port: 5179,
     strictPort: true,
     proxy: {
@@ -36,4 +40,4 @@ export default defineConfig({
       "/ws": { target: "ws://127.0.0.1:8765", ws: true },
     },
   },
-});
+}));
