@@ -244,7 +244,7 @@ def run_backtest(
         )
 
     summary = _summarize(candles, trades, equity_curve, starting_equity, equity)
-    diagnostics = _diagnostics_dict(diag, trades)
+    diagnostics = _diagnostics_dict(diag, trades, spread_pips, slippage_pips)
     return summary, trades, equity_curve, diagnostics
 
 
@@ -345,7 +345,12 @@ def _summarize(
     )
 
 
-def _diagnostics_dict(diag: BTDiagnostics, trades: list[BTTrade]) -> dict:
+def _diagnostics_dict(
+    diag: BTDiagnostics,
+    trades: list[BTTrade],
+    spread_pips: float,
+    slippage_pips: float,
+) -> dict:
     durations = [t.bars_held for t in trades]
     avg_dur = float(np.mean(durations)) if durations else 0.0
     median_dur = float(np.median(durations)) if durations else 0.0
@@ -364,6 +369,20 @@ def _diagnostics_dict(diag: BTDiagnostics, trades: list[BTTrade]) -> dict:
     for t in trades:
         exit_reasons[t.exit_reason] += 1
 
+    # Friction tax metric: round-trip cost as % of initial stop distance.
+    cost_pips_round_trip = spread_pips + 2.0 * slippage_pips
+    stop_dists_pips = [
+        abs(t.entry_price - t.initial_stop) * 10000.0 for t in trades
+    ]
+    avg_stop_pips = float(np.mean(stop_dists_pips)) if stop_dists_pips else 0.0
+    if stop_dists_pips:
+        per_trade_pcts = [
+            100.0 * cost_pips_round_trip / d for d in stop_dists_pips if d > 0
+        ]
+        cost_pct_of_stop = float(np.mean(per_trade_pcts)) if per_trade_pcts else 0.0
+    else:
+        cost_pct_of_stop = 0.0
+
     return {
         "session_end_closes": diag.session_end_closes,
         "leverage_cap_attempts": diag.leverage_cap_attempts,
@@ -378,6 +397,9 @@ def _diagnostics_dict(diag: BTDiagnostics, trades: list[BTTrade]) -> dict:
         "monthly_pnl": dict(monthly),
         "skips": dict(diag.skips),
         "exit_reasons": dict(exit_reasons),
+        "cost_pips_round_trip": cost_pips_round_trip,
+        "avg_stop_distance_pips": avg_stop_pips,
+        "cost_pct_of_stop": cost_pct_of_stop,
     }
 
 

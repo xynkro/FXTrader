@@ -43,6 +43,9 @@ def fmt_summary(label: str, r, diag: dict) -> str:
         f"  Final eq    : ${r.final_equity:,.2f} (start ${r.starting_equity:,.2f})",
         f"  Avg dur     : {diag.get('avg_bars_held', 0):.1f} bars  "
         f"(median {diag.get('median_bars_held', 0):.0f})",
+        f"  Avg stop    : {diag.get('avg_stop_distance_pips', 0):.1f} pips  "
+        f"(round-trip cost {diag.get('cost_pips_round_trip', 0):.1f} pips = "
+        f"{diag.get('cost_pct_of_stop', 0):.1f}% of stop)",
     ])
 
 
