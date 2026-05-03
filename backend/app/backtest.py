@@ -374,9 +374,19 @@ def _diagnostics_dict(
     top5_pct = (100.0 * top5_sum / gross_profit) if gross_profit > 0 else 0.0
 
     monthly: dict[str, float] = defaultdict(float)
+    yearly: dict[str, dict] = defaultdict(
+        lambda: {"pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+    )
     for t in trades:
-        mo = datetime.fromisoformat(t.exit_time).strftime("%Y-%m")
-        monthly[mo] += t.pnl
+        ex = datetime.fromisoformat(t.exit_time)
+        monthly[ex.strftime("%Y-%m")] += t.pnl
+        y = ex.strftime("%Y")
+        yearly[y]["pnl"] += t.pnl
+        yearly[y]["trades"] += 1
+        if t.pnl > 0:
+            yearly[y]["wins"] += 1
+        else:
+            yearly[y]["losses"] += 1
 
     exit_reasons: dict[str, int] = defaultdict(int)
     for t in trades:
@@ -409,6 +419,7 @@ def _diagnostics_dict(
         "median_bars_held": median_dur,
         "top5_winner_concentration_pct": top5_pct,
         "monthly_pnl": dict(monthly),
+        "yearly": {y: dict(d) for y, d in yearly.items()},
         "skips": dict(diag.skips),
         "exit_reasons": dict(exit_reasons),
         "cost_pips_round_trip": cost_pips_round_trip,

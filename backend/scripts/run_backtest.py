@@ -27,6 +27,21 @@ def load_candles(path: Path) -> list[Candle]:
     ]
 
 
+def defaultdict_year(is_d: dict, oos_d: dict) -> dict:
+    """Combine IS and OOS yearly breakdowns into one dict."""
+    out: dict = {}
+    for src in (is_d.get("yearly", {}), oos_d.get("yearly", {})):
+        for y, v in src.items():
+            slot = out.setdefault(
+                y, {"pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+            )
+            slot["pnl"] += v.get("pnl", 0.0)
+            slot["trades"] += v.get("trades", 0)
+            slot["wins"] += v.get("wins", 0)
+            slot["losses"] += v.get("losses", 0)
+    return out
+
+
 def fmt_summary(label: str, r, diag: dict) -> str:
     return "\n".join([
         f"--- {label} ---",
@@ -190,6 +205,17 @@ def main() -> int:
             print(f"    {k}: ${mo[k]:+,.2f}")
         if not mo:
             print("    (no trades)")
+
+    # 4b: yearly P&L breakdown (regime robustness check)
+    print("\n--- Yearly breakdown (full sample at default friction) ---")
+    fy = fr_diag.get("yearly", {})  # `fr` runs over full sample at 1× friction in
+    # the current setup it's actually 2× — recompute via combined IS+OOS
+    combined_yearly: dict = defaultdict_year(is_diag, oos_diag)
+    for y in sorted(combined_yearly.keys()):
+        d = combined_yearly[y]
+        wr = 100.0 * d["wins"] / d["trades"] if d["trades"] else 0.0
+        print(f"  {y}: ${d['pnl']:+,.2f}  trades={d['trades']:3d}  "
+              f"W:{d['wins']:3d} L:{d['losses']:3d}  WR={wr:5.1f}%")
 
     # 5: top-5 winner concentration
     print("\n--- Top-5 winner concentration ---")
