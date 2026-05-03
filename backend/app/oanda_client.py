@@ -139,6 +139,13 @@ class OandaClient:
         stop_price: float,
         target_price: Optional[float] = None,
     ) -> dict:
+        """Place a market order with a fixed initial stop loss.
+
+        The trailing logic is deliberately kept on the engine side (bar-close
+        anchored chandelier) to preserve backtest/live parity. We only set
+        `stopLossOnFill` here; subsequent stop tightening is done via
+        `replace_trade_stop()` on each new closed bar.
+        """
         order: dict = {
             "type": "MARKET",
             "instrument": instrument,
@@ -165,6 +172,30 @@ class OandaClient:
     ) -> dict:
         return await asyncio.to_thread(
             self._market_order_sync, instrument, units, stop_price, target_price
+        )
+
+    # ----------------------------- stop replace ---------------------------
+    def _replace_trade_stop_sync(self, trade_id: str, stop_price: float) -> dict:
+        """Replace the stop loss on an existing trade. Used by the engine to
+        manually tighten the stop on each new bar close."""
+        body = {
+            "stopLoss": {
+                "timeInForce": "GTC",
+                "price": f"{stop_price:.5f}",
+            }
+        }
+        r = trades_ep.TradeCRCDO(
+            accountID=self.account_id, tradeID=trade_id, data=body
+        )
+        try:
+            self.api.request(r)
+        except V20Error as e:
+            raise OandaError(f"TradeCRCDO failed: {e}") from e
+        return r.response
+
+    async def replace_trade_stop(self, trade_id: str, stop_price: float) -> dict:
+        return await asyncio.to_thread(
+            self._replace_trade_stop_sync, trade_id, stop_price
         )
 
     # ----------------------------- positions -------------------------------

@@ -1,6 +1,20 @@
 """Live trading loop. Polls OANDA every 30s, evaluates the strategy on
-newly-closed M5 candles, places orders through the risk manager, and
-reconciles fills/closures into the local trade log."""
+newly-closed candles, places orders through the risk manager, manages
+the bar-close-anchored chandelier trail manually (NOT broker-native),
+and reconciles fills/closures into the local trade log.
+
+Live ↔ backtest parity contract (preserved deliberately):
+- Initial stop is fixed at entry ± K * ATR_at_signal.
+- Trail update is computed only at the close of a NEW bar, using
+  highest_high_since_entry (or lowest_low_since_entry for shorts) and
+  the FROZEN ATR at signal time.
+- A trail tightening triggers an OANDA TradeCRCDO call to replace the
+  stop loss on the existing trade. This matches backtest semantics
+  (bar-close anchored chandelier) rather than OANDA's tick-by-tick
+  trailingStopLossOnFill.
+- Known acceptable mismatch: backtest fills at bar t+1 open while live
+  fills at bar t close (~30s post-close). Documented in the demo protocol.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +27,14 @@ from .db import trade_log
 from .models import EngineStatus, Side, Trade, TradeStatus
 from .oanda_client import OandaClient, OandaError, get_client
 from .risk import risk
-from .strategy import StrategyState, evaluate, in_session, position_size
+from .strategy import (
+    StrategyState,
+    evaluate,
+    in_session,
+    is_jpy_quote,
+    pip_size,
+    position_size,
+)
 
 
 log = logging.getLogger("trader")
@@ -30,7 +51,6 @@ class Engine:
         self._client: Optional[OandaClient] = None
         self._equity: float = 0.0
 
-    # ------------------------------------------------------------------
     @property
     def client(self) -> OandaClient:
         if self._client is None:
@@ -54,7 +74,6 @@ class Engine:
 
     # ------------------------------------------------------------------
     async def tick(self) -> None:
-        """One iteration: pull new candles, reconcile, evaluate, maybe trade."""
         snap = await self.client.account_snapshot()
         self._equity = snap.equity
         trade_log.snapshot_equity(snap)
@@ -75,6 +94,10 @@ class Engine:
 
         await self._reconcile_closures()
 
+        # Trail-stop update on every new bar close (parity with backtest).
+        if new_bar:
+            await self._update_trail_stops()
+
         if not new_bar:
             return
 
@@ -92,7 +115,11 @@ class Engine:
             return
         self.last_signal_time = sig.time
 
-        units, leverage_capped = position_size(snap.equity, sig.entry, sig.stop)
+        await self._open_trade_from_signal(sig, snap.equity)
+
+    # ------------------------------------------------------------------
+    async def _open_trade_from_signal(self, sig, equity: float) -> None:
+        units, leverage_capped = position_size(equity, sig.entry, sig.stop)
         if units <= 0:
             trade_log.log_event(
                 "WARN", "size_zero",
@@ -106,12 +133,29 @@ class Engine:
             )
         signed_units = units if sig.side == Side.LONG else -units
 
+        # Capture spread + bid/ask at signal time for observability.
+        try:
+            bid_at_signal, ask_at_signal = await self.client.current_price(
+                settings.INSTRUMENT
+            )
+            spread_at_signal = ask_at_signal - bid_at_signal
+            mid_at_signal = (bid_at_signal + ask_at_signal) / 2.0
+        except OandaError:
+            bid_at_signal = ask_at_signal = spread_at_signal = None
+            mid_at_signal = sig.entry
+
+        pip = pip_size(settings.INSTRUMENT)
+        spread_pips = (
+            spread_at_signal / pip if spread_at_signal is not None else None
+        )
+
+        # Initial stop is fixed at entry ± K*ATR. Engine handles trail manually.
         try:
             resp = await self.client.market_order(
                 instrument=settings.INSTRUMENT,
                 units=signed_units,
                 stop_price=sig.stop,
-                target_price=sig.target,   # may be None for trend follower
+                target_price=sig.target,   # None for trend follower
             )
         except OandaError as e:
             trade_log.log_event("ERROR", "order_failed", str(e))
@@ -122,6 +166,26 @@ class Engine:
         oanda_trade_id = fill.get("tradeOpened", {}).get("tradeID")
         fill_price = float(fill.get("price", sig.entry))
 
+        # Slippage = actual fill vs signal-time mid.
+        slippage_price = abs(fill_price - mid_at_signal) if mid_at_signal else 0.0
+        slippage_pips = slippage_price / pip
+
+        # Stop placed by OANDA may differ from requested due to precision rules.
+        oanda_stop_price: Optional[float] = None
+        for tx in resp.get("relatedTransactionIDs", []):
+            pass  # not parsed; we rely on stopLossOrderTransaction below
+        slot = resp.get("stopLossOrderTransaction") or {}
+        if slot:
+            try:
+                oanda_stop_price = float(slot.get("price"))
+            except (TypeError, ValueError):
+                oanda_stop_price = None
+        rounding = (
+            abs(oanda_stop_price - sig.stop)
+            if oanda_stop_price is not None else 0.0
+        )
+
+        # Record the trade with full provenance for trail logic + audit.
         local_trade = Trade(
             oanda_trade_id=oanda_trade_id,
             instrument=settings.INSTRUMENT,
@@ -130,19 +194,88 @@ class Engine:
             entry_time=sig.time,
             entry_price=fill_price,
             stop_price=sig.stop,
-            target_price=sig.target if sig.target is not None else 0.0,
+            initial_stop=sig.stop,
+            atr_at_entry=sig.atr,
+            trailed=False,
+            target_price=sig.target,
             status=TradeStatus.OPEN,
             reason=sig.reason,
         )
         trade_id = trade_log.insert_trade(local_trade)
         if oanda_trade_id:
             self._oanda_id_to_local[oanda_trade_id] = trade_id
-        tgt_str = f"{sig.target:.5f}" if sig.target is not None else "trail"
+
+        # Single, audit-grade entry log line (kill criteria depend on this).
         trade_log.log_event(
-            "INFO",
-            "trade_opened",
-            f"#{trade_id} {sig.side.value} {units}u @ {fill_price:.5f} "
-            f"stop={sig.stop:.5f} tgt={tgt_str}",
+            "INFO", "trade_opened",
+            (
+                f"id={trade_id} oanda={oanda_trade_id} "
+                f"side={sig.side.value} units={units} "
+                f"sig_entry={sig.entry:.5f} fill={fill_price:.5f} "
+                f"bid={bid_at_signal} ask={ask_at_signal} "
+                f"spread_pips={spread_pips:.2f} "
+                if spread_pips is not None else
+                f"id={trade_id} oanda={oanda_trade_id} "
+                f"side={sig.side.value} units={units} "
+                f"sig_entry={sig.entry:.5f} fill={fill_price:.5f} "
+                f"bid={bid_at_signal} ask={ask_at_signal} "
+                f"spread_pips=NA "
+            )
+            + (
+                f"slippage_pips={slippage_pips:.2f} assumed_slip_pips=0.20 "
+                f"initial_stop_req={sig.stop:.5f} "
+                f"initial_stop_oanda={oanda_stop_price} "
+                f"stop_rounding={rounding:.5f} "
+                f"stop_distance={sig.stop_distance:.5f} "
+                f"atr={sig.atr:.5f} reason={sig.reason}"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    async def _update_trail_stops(self) -> None:
+        """For each open local trade, compute the bar-close trail stop and
+        push the update to OANDA if it tightens. Mirrors backtest semantics:
+        trail computed at end of bar, applies starting next bar."""
+        candles = list(self.state.candles)
+        for t in trade_log.open_trades():
+            if t.atr_at_entry is None or t.initial_stop is None:
+                continue
+            # Bars strictly after entry — those held by us
+            held = [c for c in candles if c.time > t.entry_time]
+            if not held:
+                continue
+            stop_distance = abs(t.entry_price - t.initial_stop)
+            if stop_distance <= 0:
+                continue
+            if t.side == Side.LONG:
+                ext = max(c.high for c in held)
+                new_trail = ext - stop_distance
+                if new_trail > t.stop_price:
+                    await self._push_trail(t, new_trail, ext)
+            else:
+                ext = min(c.low for c in held)
+                new_trail = ext + stop_distance
+                if new_trail < t.stop_price:
+                    await self._push_trail(t, new_trail, ext)
+
+    async def _push_trail(self, t: Trade, new_stop: float, ext: float) -> None:
+        if t.oanda_trade_id is None:
+            return
+        try:
+            await self.client.replace_trade_stop(t.oanda_trade_id, new_stop)
+        except OandaError as e:
+            trade_log.log_event(
+                "ERROR", "trail_replace_failed",
+                f"id={t.id} attempted_stop={new_stop:.5f} err={e}",
+            )
+            return
+        trade_log.update_trade_stop(t.id, new_stop, trailed=True)
+        pip = pip_size(settings.INSTRUMENT)
+        trade_log.log_event(
+            "INFO", "trail_update",
+            f"id={t.id} oanda={t.oanda_trade_id} side={t.side.value} "
+            f"prev_stop={t.stop_price:.5f} new_stop={new_stop:.5f} "
+            f"ext={ext:.5f} tighter_by_pips={(abs(new_stop - t.stop_price) / pip):.2f}",
         )
 
     # ------------------------------------------------------------------
@@ -159,34 +292,50 @@ class Engine:
             if t.oanda_trade_id and t.oanda_trade_id not in oanda_open_ids:
                 bid, ask = await self.client.current_price(t.instrument)
                 exit_price = bid if t.side == Side.LONG else ask
-                planned_risk = abs(t.entry_price - t.stop_price) * abs(t.units)
-                actual = (
-                    (exit_price - t.entry_price) * t.units
-                    if t.side == Side.LONG
-                    else (t.entry_price - exit_price) * abs(t.units)
-                )
+                # P&L: convert to USD if quote=JPY (account in USD).
+                if is_jpy_quote(t.instrument):
+                    if t.side == Side.LONG:
+                        gross = ((exit_price - t.entry_price) * abs(t.units)) / exit_price
+                    else:
+                        gross = ((t.entry_price - exit_price) * abs(t.units)) / exit_price
+                    planned_risk = (
+                        abs(t.entry_price - (t.initial_stop or t.stop_price))
+                        * abs(t.units) / t.entry_price
+                    )
+                else:
+                    if t.side == Side.LONG:
+                        gross = (exit_price - t.entry_price) * abs(t.units)
+                    else:
+                        gross = (t.entry_price - exit_price) * abs(t.units)
+                    planned_risk = (
+                        abs(t.entry_price - (t.initial_stop or t.stop_price))
+                        * abs(t.units)
+                    )
+
                 pnl_pct = (
-                    100.0 * actual / self._equity if self._equity > 0 else 0.0
+                    100.0 * gross / self._equity if self._equity > 0 else 0.0
                 )
-                r = actual / planned_risk if planned_risk > 0 else 0.0
+                r = gross / planned_risk if planned_risk > 0 else 0.0
                 trade_log.close_trade(
                     trade_id=t.id,
                     exit_time=datetime.now(timezone.utc),
                     exit_price=exit_price,
-                    pnl=actual,
+                    pnl=gross,
                     pnl_pct=pnl_pct,
                     r_multiple=r,
                 )
                 t.exit_price = exit_price
-                t.pnl = actual
+                t.pnl = gross
                 t.pnl_pct = pnl_pct
                 t.r_multiple = r
                 t.status = TradeStatus.CLOSED
                 risk.record_trade_close(t)
+                exit_label = "trailing_stop" if t.trailed else "initial_stop"
                 trade_log.log_event(
-                    "INFO",
-                    "trade_closed",
-                    f"#{t.id} R={r:.2f} pnl=${actual:.2f}",
+                    "INFO", "trade_closed",
+                    f"id={t.id} oanda={t.oanda_trade_id} side={t.side.value} "
+                    f"exit_price={exit_price:.5f} pnl=${gross:.2f} "
+                    f"pnl_pct={pnl_pct:+.3f}% R={r:+.2f} exit_type={exit_label}",
                 )
 
     # ------------------------------------------------------------------

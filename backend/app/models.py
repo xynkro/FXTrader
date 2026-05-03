@@ -45,11 +45,14 @@ class Trade(BaseModel):
     oanda_trade_id: Optional[str] = None
     instrument: str
     side: Side
-    units: int                          # signed: long > 0, short < 0
+    units: int                            # signed: long > 0, short < 0
     entry_time: datetime
     entry_price: float
-    stop_price: float
-    target_price: float
+    stop_price: float                     # current active stop (updated by trail)
+    target_price: Optional[float] = None
+    initial_stop: Optional[float] = None  # stop set at entry; never changes
+    atr_at_entry: Optional[float] = None  # frozen ATR — drives trail distance
+    trailed: bool = False                 # has the trail moved at least once?
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     pnl: Optional[float] = None        # realised, in account currency

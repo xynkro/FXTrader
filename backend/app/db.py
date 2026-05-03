@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_time TEXT NOT NULL,
     entry_price REAL NOT NULL,
     stop_price REAL NOT NULL,
-    target_price REAL NOT NULL,
+    target_price REAL,
+    initial_stop REAL,
+    atr_at_entry REAL,
+    trailed INTEGER NOT NULL DEFAULT 0,
     exit_time TEXT,
     exit_price REAL,
     pnl REAL,
@@ -93,8 +96,9 @@ class TradeLog:
             cur = c.execute(
                 """INSERT INTO trades
                    (oanda_trade_id, instrument, side, units, entry_time,
-                    entry_price, stop_price, target_price, status, reason)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    entry_price, stop_price, target_price,
+                    initial_stop, atr_at_entry, trailed, status, reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     t.oanda_trade_id,
                     t.instrument,
@@ -104,11 +108,21 @@ class TradeLog:
                     t.entry_price,
                     t.stop_price,
                     t.target_price,
+                    t.initial_stop,
+                    t.atr_at_entry,
+                    1 if t.trailed else 0,
                     t.status.value,
                     t.reason,
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_trade_stop(self, trade_id: int, new_stop: float, trailed: bool) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE trades SET stop_price=?, trailed=? WHERE id=?",
+                (new_stop, 1 if trailed else 0, trade_id),
+            )
 
     def close_trade(
         self,
@@ -162,6 +176,12 @@ class TradeLog:
         return [self._row_to_trade(r) for r in rows]
 
     def _row_to_trade(self, r: sqlite3.Row) -> Trade:
+        cols = r.keys() if hasattr(r, "keys") else set()
+        def col(name, default=None):
+            try:
+                return r[name]
+            except (IndexError, KeyError):
+                return default
         return Trade(
             id=r["id"],
             oanda_trade_id=r["oanda_trade_id"],
@@ -171,7 +191,10 @@ class TradeLog:
             entry_time=_from_iso(r["entry_time"]),
             entry_price=r["entry_price"],
             stop_price=r["stop_price"],
-            target_price=r["target_price"],
+            target_price=col("target_price"),
+            initial_stop=col("initial_stop"),
+            atr_at_entry=col("atr_at_entry"),
+            trailed=bool(col("trailed", 0) or 0),
             exit_time=_from_iso(r["exit_time"]),
             exit_price=r["exit_price"],
             pnl=r["pnl"],
