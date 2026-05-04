@@ -21,6 +21,7 @@ import EnvelopeStatus from "./components/EnvelopeStatus";
 import TabNav, { type TabKey } from "./components/TabNav";
 import StrategyView from "./components/StrategyView";
 import SettingsView from "./components/SettingsView";
+import LiveChart from "./components/LiveChart";
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>("dashboard");
@@ -99,6 +100,13 @@ export default function App() {
 
       {tab === "dashboard" && (
         <>
+          <div className="mb-4">
+            <LiveChart
+              instrument={config?.instrument}
+              granularity={config?.granularity}
+            />
+          </div>
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
             <div className="lg:col-span-2">
               <EquityChart points={equity} />
