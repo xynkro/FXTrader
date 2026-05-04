@@ -102,8 +102,15 @@ End the window at **whichever comes later**:
    ```
    Adverse stop *execution drift* is measured separately under criterion 3.
 
-2. **Execution errors**. Any `order_failed`, `kill_close_failed`, or
-   `tick_exception` event appearing more than twice in any 24h period.
+2. **Execution errors**. Any of `order_failed`, `kill_close_failed`, or
+   `tick_exception` (engine-side bugs / unhandled code paths) appearing
+   more than twice in any 24h period.
+
+   **Note**: `network_error` events are *not* counted toward this
+   criterion — they're transient OANDA-side or local-network turbulence
+   (connection reset, DNS failure, read timeout, idle-connection reap)
+   and are auto-recovered on the next 30s tick. Only events the
+   classifier tags as code errors trip this criterion.
 
 3. **Behavioural drift**. After 5+ closed trades, if any of these are
    true:

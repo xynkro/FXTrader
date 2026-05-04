@@ -468,21 +468,64 @@ class Engine:
                 )
 
     # ------------------------------------------------------------------
-    async def _loop(self) -> None:
-        try:
-            await self.warm_history()
-        except OandaError as e:
-            log.error("warm_history failed: %s", e)
-            trade_log.log_event("ERROR", "warm_failed", str(e))
-            return
+    @staticmethod
+    def _classify_exception(e: BaseException) -> tuple[str, str]:
+        """Return (level, kind). Network/transient → WARN/network_error;
+        code/everything else → ERROR/tick_exception."""
+        s = repr(e).lower()
+        network_signals = (
+            "connection reset by peer",
+            "remoteDisconnected".lower(),
+            "remote end closed connection",
+            "read timed out",
+            "max retries exceeded",
+            "nameresolutionerror",
+            "failed to resolve",
+            "temporary failure in name resolution",
+            "connectionerror",
+            "connectionresetterror",
+            "timeout",
+            "sslerror",
+        )
+        if any(sig in s for sig in network_signals):
+            return "WARN", "network_error"
+        return "ERROR", "tick_exception"
 
+    async def _loop(self) -> None:
+        # warm_history: retry on network errors, hard-fail only on auth/config
+        for attempt in range(5):
+            try:
+                await self.warm_history()
+                break
+            except OandaError as e:
+                level, kind = self._classify_exception(e)
+                trade_log.log_event(level, f"warm_{kind}", str(e))
+                if level == "ERROR":
+                    log.error("warm_history hard-failed: %s", e)
+                    return
+                await asyncio.sleep(min(30 * (attempt + 1), 120))
+            except BaseException as e:  # noqa: BLE001
+                log.exception("warm_history unexpected: %s", e)
+                trade_log.log_event("ERROR", "warm_unexpected", repr(e))
+                return
+
+        # Main loop: NEVER die silently. Catch BaseException (including
+        # asyncio.CancelledError from idle-connection reaps in 3.8+).
+        # Classify network turbulence as WARN so kill criterion 2 doesn't
+        # mistake it for engine instability.
         while self._running:
             try:
                 await self.tick()
-            except Exception as e:  # noqa: BLE001
-                log.exception("tick failed")
-                trade_log.log_event("ERROR", "tick_exception", str(e))
-            await asyncio.sleep(30)
+            except BaseException as e:  # noqa: BLE001
+                level, kind = self._classify_exception(e)
+                if level == "ERROR":
+                    log.exception("tick failed (code error)")
+                trade_log.log_event(level, kind, str(e)[:500])
+            try:
+                await asyncio.sleep(30)
+            except BaseException:  # noqa: BLE001
+                # Cancelled mid-sleep → just break out cleanly
+                break
 
     def start(self) -> None:
         if self._running:
