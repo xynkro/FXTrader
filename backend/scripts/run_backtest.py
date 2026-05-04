@@ -14,6 +14,15 @@ from app.models import Candle
 from app.strategy import STRATEGIES, StrategyParams
 
 
+def maybe_load_macro(strategy: str, candles: list[Candle]) -> Optional[dict]:
+    if strategy != "swing_carry":
+        return None
+    from app.data_sources import build_macro_features
+    if not candles:
+        return None
+    return build_macro_features(candles[0].time.date(), candles[-1].time.date())
+
+
 def load_candles(path: Path) -> list[Candle]:
     raw = json.loads(path.read_text())
     return [
@@ -172,25 +181,40 @@ def main() -> int:
     oos_candles = candles[split:]
 
     eval_fn = STRATEGIES[args.strategy]
+    macro_full = maybe_load_macro(args.strategy, candles)
+    macro_is = maybe_load_macro(args.strategy, is_candles) if macro_full else None
+    macro_oos = maybe_load_macro(args.strategy, oos_candles) if macro_full else None
+
+    # Daily/swing strategies don't have an intraday session — disable
+    # both signal-window and session-end-close filters automatically.
+    is_swing = args.strategy in ("swing_carry",) or args.granularity in ("D", "W", "M")
+    sigs_in_session = not is_swing
+    force_close = not is_swing and not args.no_session_close
 
     is_result, is_trades, is_eq, is_diag = run_backtest(
         is_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
         evaluate_fn=eval_fn,
-        force_close_at_session_end=not args.no_session_close,
+        signal_in_session_only=sigs_in_session,
+        force_close_at_session_end=force_close,
+        macro_features=macro_is,
     )
     oos_result, oos_trades, oos_eq, oos_diag = run_backtest(
         oos_candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
         evaluate_fn=eval_fn,
-        force_close_at_session_end=not args.no_session_close,
+        signal_in_session_only=sigs_in_session,
+        force_close_at_session_end=force_close,
+        macro_features=macro_oos,
     )
     fr_result, fr_trades, fr_eq, fr_diag = run_backtest(
         candles, starting_equity=args.equity, params=StrategyParams(),
         spread_pips=2.0 * args.spread_pips,
         slippage_pips=2.0 * args.slippage_pips,
         evaluate_fn=eval_fn,
-        force_close_at_session_end=not args.no_session_close,
+        signal_in_session_only=sigs_in_session,
+        force_close_at_session_end=force_close,
+        macro_features=macro_full,
     )
 
     save_results(is_result, is_trades, is_eq, is_diag, label=f"{args.label}_IS")

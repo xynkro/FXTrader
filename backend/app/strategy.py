@@ -115,10 +115,14 @@ class StrategyParams:
 class StrategyState:
     params: StrategyParams = field(default_factory=StrategyParams)
     # Bigger window so pullback (sma_long=100) and compression (lookback=100)
-    # have full warmup history available.
-    candles: deque = field(default_factory=lambda: deque(maxlen=300))
+    # have full warmup history available. Daily swing strategies need 200+
+    # bars (~10 months) for SMA(50) etc; bumped accordingly.
+    candles: deque = field(default_factory=lambda: deque(maxlen=400))
     long_cooldown: int = 0
     short_cooldown: int = 0
+    # Macro features (date -> {us10y_pct, jp10y_pct, yield_diff, vix})
+    # Empty for intraday/non-macro strategies; populated for swing.
+    macro: dict = field(default_factory=dict)
 
     def add(self, c: Candle) -> None:
         if self.candles and self.candles[-1].time == c.time:
@@ -199,10 +203,15 @@ def _preamble(
     state: StrategyState,
     diagnostics: Optional[dict],
     min_warmup: int,
+    check_session: bool = True,
 ):
     """Common gate checks. Returns either a tuple (candles, p, closes, highs,
     lows, atr_value, stop_distance, pip, last) ready for evaluation, or
-    a `None` from `skip(...)` already recorded in diagnostics."""
+    a `None` from `skip(...)` already recorded in diagnostics.
+
+    `check_session=False` for swing/daily strategies where the intraday
+    session filter doesn't apply.
+    """
     def skip(key: str):
         if diagnostics is not None:
             k = f"skip_{key}"
@@ -213,7 +222,7 @@ def _preamble(
         return skip("warmup"), None
     candles = list(state.candles)
     last = candles[-1]
-    if not in_session(last.time):
+    if check_session and not in_session(last.time):
         return skip("out_of_session"), None
 
     p = state.params
@@ -790,6 +799,104 @@ def evaluate_engulfing_pivot(
     _record_skip(diagnostics, "no_engulfing_or_pin"); return None
 
 
+# --- Class S: Swing Carry-Momentum (daily) ------------------------------
+def evaluate_swing_carry(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Multi-day carry-momentum on USD/JPY daily bars.
+
+    Long entry — ALL three conditions must hold at daily close:
+      1. close > SMA(20) > SMA(50)  (trend)
+      2. yield_diff (US10Y − JP10Y) > 0  (carry favourable)
+      3. VIX < 25  (no risk-off / crash regime)
+
+    Short — mirror.
+
+    Stop = entry ± K × ATR(20). Hard regime kill: VIX > 30 — handled by
+    the engine's risk layer, not in this signal function.
+    """
+    p = state.params
+    # Bigger warmup for daily swing — need SMA(50)+ history.
+    # Session filter disabled — daily bars don't have an intraday session.
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.sma_long, 60),
+        check_session=False,
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes = ctx["closes"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; pip = ctx["pip"]
+
+    # Override stop multiplier — daily ATRs are bigger; K=2.0 still applies
+    # but min_stop_pips needs to be 20 for daily (set in StrategyParams
+    # default for swing usage; here we just verify).
+    stop_distance = p.stop_atr_mult * a
+    if stop_distance < 20.0 * pip:
+        return _record_skip(diagnostics, "stop_below_min_swing")
+
+    # Trend filter
+    sma20 = float(closes[-20:].mean())
+    sma50 = float(closes[-50:].mean())
+    long_trend = (last.close > sma20) and (sma20 > sma50)
+    short_trend = (last.close < sma20) and (sma20 < sma50)
+
+    # Macro lookup
+    bar_date = last.time.date()
+    macro = state.macro.get(bar_date)
+    if macro is None:
+        # Try a few earlier dates (weekend / holiday shifts)
+        from datetime import timedelta as _td
+        for back in range(1, 5):
+            macro = state.macro.get(bar_date - _td(days=back))
+            if macro is not None:
+                break
+    if macro is None:
+        return _record_skip(diagnostics, "no_macro_data")
+
+    yield_diff = macro["yield_diff"]    # US10Y - JP10Y, %
+    vix = macro["vix"]
+
+    # Risk-regime filter — fundamentally non-directional
+    if vix >= 25.0:
+        return _record_skip(diagnostics, "vix_risk_off")
+
+    # Carry filter — directional
+    long_carry = yield_diff > 0
+    short_carry = yield_diff < 0
+
+    if long_trend and long_carry:
+        if state.long_cooldown > 0:
+            return _record_skip(diagnostics, "cooldown_long")
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"swing_long sma20={sma20:.4f} sma50={sma50:.4f} "
+                f"yd={yield_diff:+.2f}pp vix={vix:.1f} ATR{atr_pips:.0f}p"
+            ),
+        )
+    if short_trend and short_carry:
+        if state.short_cooldown > 0:
+            return _record_skip(diagnostics, "cooldown_short")
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"swing_short yd={yield_diff:+.2f}pp vix={vix:.1f} "
+                f"ATR{atr_pips:.0f}p"
+            ),
+        )
+
+    return _record_skip(diagnostics, "no_swing_alignment")
+
+
 # Backwards-compat alias used by trader.py / backtest.py default.
 evaluate = evaluate_donchian
 
@@ -803,4 +910,5 @@ STRATEGIES = {
     "session_vwap":     evaluate_session_vwap,
     "bb_squeeze":       evaluate_bb_squeeze,
     "engulfing_pivot":  evaluate_engulfing_pivot,
+    "swing_carry":      evaluate_swing_carry,
 }

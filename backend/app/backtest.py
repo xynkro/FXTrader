@@ -101,12 +101,15 @@ def run_backtest(
     signal_in_session_only: bool = True,
     force_close_at_session_end: bool = True,
     evaluate_fn: Optional[Callable] = None,
+    macro_features: Optional[dict] = None,
 ) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]], dict]:
     if not candles:
         raise ValueError("no candles supplied")
 
     p = params or StrategyParams()
     state = StrategyState(params=p)
+    if macro_features is not None:
+        state.macro = macro_features
     eval_fn = evaluate_fn or evaluate_default
     diag = BTDiagnostics()
     trades: list[BTTrade] = []
