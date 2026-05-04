@@ -22,6 +22,7 @@ import TabNav, { type TabKey } from "./components/TabNav";
 import StrategyView from "./components/StrategyView";
 import SettingsView from "./components/SettingsView";
 import LiveChart from "./components/LiveChart";
+import StrategyVitals from "./components/StrategyVitals";
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>("dashboard");
@@ -105,6 +106,10 @@ export default function App() {
               instrument={config?.instrument}
               granularity={config?.granularity}
             />
+          </div>
+
+          <div className="mb-4">
+            <StrategyVitals />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">

@@ -912,3 +912,176 @@ STRATEGIES = {
     "engulfing_pivot":  evaluate_engulfing_pivot,
     "swing_carry":      evaluate_swing_carry,
 }
+
+
+# ---------------------------------------------------------------------------
+#  Strategy "vitals" — gate-by-gate diagnostic for the live PWA dashboard.
+#  Mirrors the EXACT logic each evaluator uses, but returns the gate state
+#  instead of a Signal. Lets the user see *why* the strategy isn't firing.
+# ---------------------------------------------------------------------------
+def _gate(label: str, ok: bool, value: str = "", needed: str = "") -> dict:
+    return {"label": label, "ok": bool(ok), "value": value, "needed": needed}
+
+
+def compute_pullback_vitals(state: StrategyState) -> dict:
+    p = state.params
+    min_warmup = max(
+        p.sma_long + p.trend_slope_lookback,
+        p.atr_period + 1,
+        p.pullback_lookback + 1,
+    )
+    if not state.warm(min_warmup):
+        return {
+            "strategy": "pullback",
+            "warming_up": True,
+            "bars_loaded": len(state.candles),
+            "bars_needed": min_warmup,
+        }
+
+    candles = list(state.candles)
+    last = candles[-1]
+    closes = np.array([c.close for c in candles], dtype=float)
+    highs  = np.array([c.high  for c in candles], dtype=float)
+    lows   = np.array([c.low   for c in candles], dtype=float)
+
+    a = atr(highs, lows, closes, p.atr_period)
+    pip = pip_size(settings.INSTRUMENT)
+    atr_pips = a / pip if not np.isnan(a) else 0.0
+    stop_distance = p.stop_atr_mult * a if not np.isnan(a) else 0.0
+    stop_pips = stop_distance / pip if pip > 0 else 0.0
+
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+    slope_pips = (sma_long_now - sma_long_prev) / pip if pip > 0 else 0.0
+
+    # Pullback-touch gate
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_window.append(float(closes[-p.sma_short - i : -i].mean()))
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    sess_active = in_session(last.time)
+
+    long_gates = [
+        _gate("In session",
+              sess_active,
+              value=last.time.isoformat()[:16],
+              needed=f"{settings.SESSION_START_UTC}-{settings.SESSION_END_UTC} UTC"),
+        _gate("ATR ≥ min",
+              atr_pips >= p.min_atr_pips,
+              value=f"{atr_pips:.1f}p",
+              needed=f"≥{p.min_atr_pips}p"),
+        _gate("Stop ≥ min",
+              stop_distance >= p.min_stop_pips * pip,
+              value=f"{stop_pips:.1f}p",
+              needed=f"≥{p.min_stop_pips}p"),
+        _gate("close > SMA(long)",
+              last.close > sma_long_now,
+              value=f"{last.close:.3f}",
+              needed=f">{sma_long_now:.3f}"),
+        _gate("SMA(long) sloping ↑",
+              sma_long_now > sma_long_prev,
+              value=f"{slope_pips:+.1f}p / {p.trend_slope_lookback}b",
+              needed="positive slope"),
+        _gate("close > SMA(short) [trigger]",
+              last.close > sma_short_now,
+              value=f"{last.close:.3f}",
+              needed=f">{sma_short_now:.3f}"),
+        _gate("recent low touched SMA(short)",
+              long_pullback,
+              value=f"min low {float(recent_lows.min()):.3f}",
+              needed=f"≤ ~{sma_short_now:.3f} in last {lb}b"),
+        _gate("Cooldown clear",
+              state.long_cooldown == 0,
+              value=f"{state.long_cooldown} bars",
+              needed="0"),
+    ]
+
+    short_gates = [
+        _gate("In session",
+              sess_active,
+              value=last.time.isoformat()[:16],
+              needed=f"{settings.SESSION_START_UTC}-{settings.SESSION_END_UTC} UTC"),
+        _gate("ATR ≥ min",
+              atr_pips >= p.min_atr_pips,
+              value=f"{atr_pips:.1f}p",
+              needed=f"≥{p.min_atr_pips}p"),
+        _gate("Stop ≥ min",
+              stop_distance >= p.min_stop_pips * pip,
+              value=f"{stop_pips:.1f}p",
+              needed=f"≥{p.min_stop_pips}p"),
+        _gate("close < SMA(long)",
+              last.close < sma_long_now,
+              value=f"{last.close:.3f}",
+              needed=f"<{sma_long_now:.3f}"),
+        _gate("SMA(long) sloping ↓",
+              sma_long_now < sma_long_prev,
+              value=f"{slope_pips:+.1f}p / {p.trend_slope_lookback}b",
+              needed="negative slope"),
+        _gate("close < SMA(short) [trigger]",
+              last.close < sma_short_now,
+              value=f"{last.close:.3f}",
+              needed=f"<{sma_short_now:.3f}"),
+        _gate("recent high touched SMA(short)",
+              short_pullback,
+              value=f"max high {float(recent_highs.max()):.3f}",
+              needed=f"≥ ~{sma_short_now:.3f} in last {lb}b"),
+        _gate("Cooldown clear",
+              state.short_cooldown == 0,
+              value=f"{state.short_cooldown} bars",
+              needed="0"),
+    ]
+
+    return {
+        "strategy": "pullback",
+        "warming_up": False,
+        "instrument": settings.INSTRUMENT,
+        "granularity": settings.GRANULARITY,
+        "last_candle_time": last.time.isoformat(),
+        "last_close": last.close,
+        "indicators": {
+            "sma_short": sma_short_now,
+            "sma_long_now": sma_long_now,
+            "sma_long_prev": sma_long_prev,
+            "sma_long_slope_pips": slope_pips,
+            "atr_pips": atr_pips,
+            "stop_distance_pips": stop_pips,
+        },
+        "long": {
+            "all_pass": all(g["ok"] for g in long_gates),
+            "passes": sum(1 for g in long_gates if g["ok"]),
+            "total": len(long_gates),
+            "gates": long_gates,
+        },
+        "short": {
+            "all_pass": all(g["ok"] for g in short_gates),
+            "passes": sum(1 for g in short_gates if g["ok"]),
+            "total": len(short_gates),
+            "gates": short_gates,
+        },
+    }
+
+
+def compute_strategy_vitals(state: StrategyState, strategy_name: str) -> dict:
+    """Dispatch to per-strategy vitals function. Returns informational dict
+    or `{not_implemented: True}` for strategies that don't yet have a
+    diagnostic view."""
+    if strategy_name == "pullback":
+        return compute_pullback_vitals(state)
+    return {
+        "strategy": strategy_name,
+        "not_implemented": True,
+        "message": f"Live vitals view not yet implemented for '{strategy_name}'. "
+                   "Pullback is the only strategy with a vitals panel for now.",
+    }

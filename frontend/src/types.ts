@@ -86,3 +86,40 @@ export interface OandaPosition {
   price: string;
   openTime: string;
 }
+
+export interface VitalGate {
+  label: string;
+  ok: boolean;
+  value: string;
+  needed: string;
+}
+
+export interface VitalSide {
+  all_pass: boolean;
+  passes: number;
+  total: number;
+  gates: VitalGate[];
+}
+
+export interface StrategyVitals {
+  strategy: string;
+  warming_up?: boolean;
+  bars_loaded?: number;
+  bars_needed?: number;
+  not_implemented?: boolean;
+  message?: string;
+  instrument?: string;
+  granularity?: string;
+  last_candle_time?: string;
+  last_close?: number;
+  indicators?: {
+    sma_short: number;
+    sma_long_now: number;
+    sma_long_prev: number;
+    sma_long_slope_pips: number;
+    atr_pips: number;
+    stop_distance_pips: number;
+  };
+  long?: VitalSide;
+  short?: VitalSide;
+}

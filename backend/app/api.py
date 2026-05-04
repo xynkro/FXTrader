@@ -10,7 +10,7 @@ from .config import settings
 from .db import trade_log
 from .oanda_client import OandaError
 from .risk import risk
-from .strategy import STRATEGIES, StrategyParams
+from .strategy import STRATEGIES, StrategyParams, compute_strategy_vitals
 from .trader import engine
 
 
@@ -95,6 +95,17 @@ async def equity(limit: int = 5000):
 @router.get("/events")
 async def events(limit: int = 200):
     return trade_log.recent_events(limit)
+
+
+@router.get("/strategy_vitals")
+async def strategy_vitals():
+    """Live gate-by-gate diagnostic of the configured strategy.
+
+    Computes the EXACT same gates the engine uses, against the most
+    recent bar in the engine's StrategyState. Lets the user see *why*
+    a strategy is or isn't firing right now.
+    """
+    return compute_strategy_vitals(engine.state, settings.STRATEGY_NAME)
 
 
 @router.post("/trading/enable")
