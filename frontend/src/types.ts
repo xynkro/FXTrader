@@ -30,7 +30,11 @@ export interface Trade {
   entry_time: string;
   entry_price: number;
   stop_price: number;
-  target_price: number;
+  target_price: number | null;
+  initial_stop: number | null;
+  atr_at_entry: number | null;
+  trailed: boolean;
+  is_shadow: boolean;
   exit_time: string | null;
   exit_price: number | null;
   pnl: number | null;

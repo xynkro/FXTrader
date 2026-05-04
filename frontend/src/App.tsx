@@ -16,6 +16,8 @@ import PositionsTable from "./components/PositionsTable";
 import TradesTable from "./components/TradesTable";
 import ControlPanel from "./components/ControlPanel";
 import EventsPanel from "./components/EventsPanel";
+import ConnectionHealth from "./components/ConnectionHealth";
+import EnvelopeStatus from "./components/EnvelopeStatus";
 
 export default function App() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
@@ -79,6 +81,10 @@ export default function App() {
     <div className="min-h-screen p-4 md:p-6 max-w-[1400px] mx-auto">
       <Header status={status} account={account} config={config} />
 
+      <div className="mb-4 -mt-2">
+        <ConnectionHealth equity={equity} events={events} />
+      </div>
+
       {error && (
         <div className="panel p-3 mb-4 border-danger/40 text-danger text-sm">
           backend not reachable: {error}. Is the backend running on port 8765?
@@ -96,8 +102,13 @@ export default function App() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+        <EnvelopeStatus status={status} config={config} trades={trades} />
         <PositionsTable positions={positions} />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
         <EventsPanel events={events} />
+        <div /> {/* spacer; trades table is full-width below */}
       </div>
 
       <TradesTable trades={trades} />

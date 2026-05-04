@@ -18,53 +18,92 @@ export default function TradesTable({ trades }: { trades: Trade[] }) {
                 <th className="text-left">Side</th>
                 <th className="text-right">Units</th>
                 <th className="text-right">Entry</th>
-                <th className="text-right">Stop</th>
-                <th className="text-right">Target</th>
+                <th className="text-right">Init stop</th>
+                <th className="text-right">Cur stop</th>
                 <th className="text-right">Exit</th>
-                <th className="text-right">P&L</th>
+                <th className="text-right">P&amp;L</th>
                 <th className="text-right">R</th>
-                <th className="text-left pl-3">Status</th>
+                <th className="text-center pl-3">Exit type</th>
+                <th className="text-center pl-2">Status</th>
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
-                <tr key={t.id} className="border-t border-border/40">
-                  <td className="py-1.5 whitespace-nowrap">{fmtTime(t.entry_time)}</td>
-                  <td>
-                    <span
-                      className={
-                        t.side === "long" ? "text-accent" : "text-danger"
-                      }
+              {trades.map((t) => {
+                const isClosed = t.status === "closed";
+                const exitType = !isClosed
+                  ? null
+                  : t.trailed
+                  ? "trail"
+                  : "initial";
+                return (
+                  <tr key={t.id} className="border-t border-border/40">
+                    <td className="py-1.5 whitespace-nowrap">
+                      {fmtTime(t.entry_time)}
+                      {t.is_shadow && (
+                        <span className="ml-1 text-[10px] text-muted">[shadow]</span>
+                      )}
+                    </td>
+                    <td>
+                      <span
+                        className={
+                          t.side === "long" ? "text-accent" : "text-danger"
+                        }
+                      >
+                        {t.side.toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="text-right tabular-nums">
+                      {Math.abs(t.units).toLocaleString()}
+                    </td>
+                    <td className="text-right tabular-nums">
+                      {fmtPrice(t.entry_price)}
+                    </td>
+                    <td className="text-right text-muted tabular-nums">
+                      {t.initial_stop != null
+                        ? fmtPrice(t.initial_stop)
+                        : fmtPrice(t.stop_price)}
+                    </td>
+                    <td
+                      className={`text-right tabular-nums ${
+                        t.trailed ? "text-accent" : "text-muted"
+                      }`}
                     >
-                      {t.side.toUpperCase()}
-                    </span>
-                  </td>
-                  <td className="text-right">{Math.abs(t.units).toLocaleString()}</td>
-                  <td className="text-right">{fmtPrice(t.entry_price)}</td>
-                  <td className="text-right text-muted">{fmtPrice(t.stop_price)}</td>
-                  <td className="text-right text-muted">{fmtPrice(t.target_price)}</td>
-                  <td className="text-right">
-                    {t.exit_price != null ? fmtPrice(t.exit_price) : "—"}
-                  </td>
-                  <td className={`text-right ${pnlColor(t.pnl)}`}>
-                    {t.pnl != null
-                      ? `${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}`
-                      : "—"}
-                  </td>
-                  <td
-                    className={`text-right ${pnlColor(t.r_multiple)}`}
-                  >
-                    {t.r_multiple != null ? t.r_multiple.toFixed(2) : "—"}
-                  </td>
-                  <td className="pl-3">
-                    {t.status === "open" ? (
-                      <span className="tag-warn">OPEN</span>
-                    ) : (
-                      <span className="tag-off">{t.status.toUpperCase()}</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
+                      {fmtPrice(t.stop_price)}
+                    </td>
+                    <td className="text-right tabular-nums">
+                      {t.exit_price != null ? fmtPrice(t.exit_price) : "—"}
+                    </td>
+                    <td className={`text-right tabular-nums ${pnlColor(t.pnl)}`}>
+                      {t.pnl != null
+                        ? `${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}`
+                        : "—"}
+                    </td>
+                    <td
+                      className={`text-right tabular-nums ${pnlColor(
+                        t.r_multiple
+                      )}`}
+                    >
+                      {t.r_multiple != null ? t.r_multiple.toFixed(2) : "—"}
+                    </td>
+                    <td className="text-center pl-3 text-xs">
+                      {exitType === null ? (
+                        <span className="text-muted">—</span>
+                      ) : exitType === "trail" ? (
+                        <span className="text-accent">trail</span>
+                      ) : (
+                        <span className="text-warn">initial</span>
+                      )}
+                    </td>
+                    <td className="text-center pl-2">
+                      {t.status === "open" ? (
+                        <span className="tag-warn">OPEN</span>
+                      ) : (
+                        <span className="tag-off">{t.status.toUpperCase()}</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
