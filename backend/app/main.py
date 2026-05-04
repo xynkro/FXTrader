@@ -39,7 +39,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FXTrader", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_ORIGIN, "http://localhost:5179"],
+    allow_origins=[
+        settings.FRONTEND_ORIGIN,
+        "http://localhost:5179",
+        "http://100.116.45.58:5179",  # Mac's Tailscale tailnet IP
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
