@@ -434,12 +434,373 @@ def evaluate_volsqueeze(
     _record_skip(diagnostics, "no_breakout_in_squeeze"); return None
 
 
+# --- Class D: Liquidity Sweep / Spring Reversal -------------------------
+def evaluate_liquidity_sweep(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Osler-style stop-cluster cascade fade.
+
+    A bar prints a wick beyond the prior N-bar swing high/low (sweep) and
+    closes back inside the range (rejection). The candle is the entire
+    setup — no next-bar confirmation needed since the engine fills at the
+    bar's close. Stop is placed beyond the wick + buffer (wider than
+    K*ATR), so the strategy's stop_distance is overridden by the actual
+    geometry; sizing scales accordingly via the engine's general formula.
+    """
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.donchian_period + 1, p.atr_period + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]; highs = ctx["highs"]; lows = ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]
+
+    n = p.donchian_period
+    prev_high = float(highs[-n - 1 : -1].max())
+    prev_low  = float(lows[ -n - 1 : -1].min())
+
+    sweep_thresh = 0.25 * a  # require meaningful penetration
+    buffer = 0.5 * a
+
+    # SHORT: bar swept above the prior swing high but closed back below it
+    if (last.high > prev_high + sweep_thresh) and (last.close < prev_high):
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        entry = last.close
+        stop = last.high + buffer
+        sd = stop - entry
+        if sd <= 0:
+            _record_skip(diagnostics, "stop_below_entry"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=entry,
+            stop=stop, target=None, atr=a, stop_distance=sd,
+            reason=(
+                f"sweep_short prev_hi={prev_high:.5f} wick={last.high:.5f} "
+                f"ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    # LONG: mirror
+    if (last.low < prev_low - sweep_thresh) and (last.close > prev_low):
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        entry = last.close
+        stop = last.low - buffer
+        sd = entry - stop
+        if sd <= 0:
+            _record_skip(diagnostics, "stop_below_entry"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=entry,
+            stop=stop, target=None, atr=a, stop_distance=sd,
+            reason=(
+                f"sweep_long prev_lo={prev_low:.5f} wick={last.low:.5f} "
+                f"ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    _record_skip(diagnostics, "no_sweep"); return None
+
+
+# --- Class E: Z-score Mean Reversion ------------------------------------
+def evaluate_zscore_meanrev(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Standardised price-deviation reversion. Andersen-Bollerslev 1998
+    documented intraday FX reversion structure; this is the simplest direct
+    encoding. Requires |z| > 2 for entry."""
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.bb_period + 1, p.atr_period + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]; closes = ctx["closes"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    n = p.bb_period
+    window = closes[-n:]
+    mean = float(window.mean())
+    sd = float(window.std(ddof=0))
+    if sd <= 0:
+        _record_skip(diagnostics, "no_std"); return None
+    z = (last.close - mean) / sd
+
+    Z_THRESH = 2.0
+    if z < -Z_THRESH:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"zscore_long z={z:.2f} mean={mean:.5f} ATR{atr_pips:.1f}p",
+        )
+    if z > Z_THRESH:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"zscore_short z={z:.2f} ATR{atr_pips:.1f}p",
+        )
+    _record_skip(diagnostics, "no_zscore_extreme"); return None
+
+
+# --- Class F: Session VWAP Reversion ------------------------------------
+def evaluate_session_vwap(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Volume-weighted intraday mean (anchored at session open). Tick-volume
+    proxy weakens the academic thesis — degrades to vol-weighted-mean
+    reversion if true notional doesn't transfer cleanly."""
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.bb_period + 1, p.atr_period + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    candles = ctx["candles"]; last = ctx["last"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    sess_start_h = int(settings.SESSION_START_UTC.split(":")[0])
+    sess_end_h   = int(settings.SESSION_END_UTC.split(":")[0])
+    last_date = last.time.date()
+    session_bars = [
+        c for c in candles
+        if c.time.date() == last_date
+        and sess_start_h <= c.time.hour < sess_end_h
+    ]
+    if len(session_bars) < 3:
+        _record_skip(diagnostics, "session_warmup"); return None
+
+    typicals = [(c.high + c.low + c.close) / 3.0 for c in session_bars]
+    weights = [max(c.volume, 1) for c in session_bars]
+    total_w = float(sum(weights))
+    vwap = sum(t * w for t, w in zip(typicals, weights)) / total_w
+    sq_dev = sum(w * (t - vwap) ** 2 for t, w in zip(typicals, weights)) / total_w
+    sd = sq_dev ** 0.5
+    if sd <= 0:
+        _record_skip(diagnostics, "no_vwap_std"); return None
+
+    K_BAND = 2.0
+    if last.close > vwap + K_BAND * sd:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"vwap_short vwap={vwap:.5f} sd={sd:.5f} ATR{atr_pips:.1f}p",
+        )
+    if last.close < vwap - K_BAND * sd:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"vwap_long vwap={vwap:.5f} ATR{atr_pips:.1f}p",
+        )
+    _record_skip(diagnostics, "within_vwap_band"); return None
+
+
+# --- Class G: Bollinger Squeeze release ---------------------------------
+def evaluate_bb_squeeze(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Carter-style squeeze-release. Trade the bar where BB(20,2) exits
+    Keltner(20, 1.5*ATR), in the direction of price-vs-mid momentum.
+    Different from the existing volsqueeze (which trades while compressed)."""
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.bb_period + 2, p.atr_period + 2),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes = ctx["closes"]; highs = ctx["highs"]; lows = ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    n = p.bb_period
+    window = closes[-n:]
+    mid = float(window.mean())
+    bb_sd = float(window.std(ddof=0))
+    bb_upper = mid + p.bb_mult * bb_sd
+    bb_lower = mid - p.bb_mult * bb_sd
+    KC_MULT = 1.5
+    kc_upper = mid + KC_MULT * a
+    kc_lower = mid - KC_MULT * a
+
+    # Prior bar's BB vs Keltner: was it squeezed?
+    prev_window = closes[-n - 1 : -1]
+    prev_mid = float(prev_window.mean())
+    prev_bb_sd = float(prev_window.std(ddof=0))
+    prev_bb_upper = prev_mid + p.bb_mult * prev_bb_sd
+    prev_bb_lower = prev_mid - p.bb_mult * prev_bb_sd
+    prev_atr = atr(highs[:-1], lows[:-1], closes[:-1], p.atr_period)
+    if np.isnan(prev_atr):
+        _record_skip(diagnostics, "warmup"); return None
+    prev_kc_upper = prev_mid + KC_MULT * prev_atr
+    prev_kc_lower = prev_mid - KC_MULT * prev_atr
+
+    was_squeezed = (prev_bb_upper < prev_kc_upper) and (prev_bb_lower > prev_kc_lower)
+    is_released = (bb_upper > kc_upper) or (bb_lower < kc_lower)
+    if not (was_squeezed and is_released):
+        _record_skip(diagnostics, "no_squeeze_release"); return None
+
+    momentum = last.close - mid
+    if momentum > 0:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"sq_release_long mid={mid:.5f} ATR{atr_pips:.1f}p",
+        )
+    else:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"sq_release_short mid={mid:.5f} ATR{atr_pips:.1f}p",
+        )
+
+
+# --- Class H: Engulfing/Pin at Pivot ------------------------------------
+def evaluate_engulfing_pivot(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """Engulfing or pin-bar within 0.25*ATR of PDH/PDL/Classic Pivot/R1/S1.
+    Fully deterministic — no swing-pivot ambiguity, levels are computed
+    from the prior UTC day's OHLC."""
+    p = state.params
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=48,  # need ~2 days of H1 history
+    )
+    if ctx is None:
+        return pre_skip
+
+    candles = ctx["candles"]; last = ctx["last"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    if len(candles) < 2:
+        _record_skip(diagnostics, "warmup"); return None
+    prev_bar = candles[-2]
+
+    # Find prior UTC day's OHLC from candle history
+    last_date = last.time.date()
+    prior = [c for c in candles[:-1] if c.time.date() < last_date]
+    if not prior:
+        _record_skip(diagnostics, "no_prior_day"); return None
+    pd_date = max(c.time.date() for c in prior)
+    pd_bars = [c for c in prior if c.time.date() == pd_date]
+    if len(pd_bars) < 5:
+        _record_skip(diagnostics, "thin_prior_day"); return None
+    pdh = max(c.high for c in pd_bars)
+    pdl = min(c.low  for c in pd_bars)
+    pdc = pd_bars[-1].close
+
+    pivot = (pdh + pdl + pdc) / 3.0
+    r1 = 2 * pivot - pdl
+    s1 = 2 * pivot - pdh
+    levels = [pdh, pdl, pivot, r1, s1]
+
+    # --- Pattern detection ---
+    body = abs(last.close - last.open)
+    rng = last.high - last.low
+    if rng <= 0:
+        _record_skip(diagnostics, "zero_range"); return None
+    upper_wick = last.high - max(last.open, last.close)
+    lower_wick = min(last.open, last.close) - last.low
+
+    bull_engulf = (
+        prev_bar.close < prev_bar.open and
+        last.close > last.open and
+        last.close > prev_bar.open and
+        last.open  < prev_bar.close
+    )
+    bear_engulf = (
+        prev_bar.close > prev_bar.open and
+        last.close < last.open and
+        last.close < prev_bar.open and
+        last.open  > prev_bar.close
+    )
+    bull_pin = (
+        body > 0 and
+        lower_wick >= 2 * body and
+        lower_wick >= 0.66 * rng and
+        upper_wick <= 0.20 * rng
+    )
+    bear_pin = (
+        body > 0 and
+        upper_wick >= 2 * body and
+        upper_wick >= 0.66 * rng and
+        lower_wick <= 0.20 * rng
+    )
+
+    near_thresh = 0.25 * a
+    near_level = any(abs(last.close - lv) < near_thresh for lv in levels)
+    if not near_level:
+        _record_skip(diagnostics, "no_pivot_proximity"); return None
+
+    if bull_engulf or bull_pin:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        kind = "engulf" if bull_engulf else "pin"
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"{kind}_long_at_pivot pdh={pdh:.5f} pdl={pdl:.5f} ATR{atr_pips:.1f}p",
+        )
+    if bear_engulf or bear_pin:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        kind = "engulf" if bear_engulf else "pin"
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=f"{kind}_short_at_pivot pdh={pdh:.5f} pdl={pdl:.5f} ATR{atr_pips:.1f}p",
+        )
+    _record_skip(diagnostics, "no_engulfing_or_pin"); return None
+
+
 # Backwards-compat alias used by trader.py / backtest.py default.
 evaluate = evaluate_donchian
 
 
 STRATEGIES = {
-    "donchian":   evaluate_donchian,
-    "pullback":   evaluate_pullback,
-    "volsqueeze": evaluate_volsqueeze,
+    "donchian":         evaluate_donchian,
+    "pullback":         evaluate_pullback,
+    "volsqueeze":       evaluate_volsqueeze,
+    "liquidity_sweep":  evaluate_liquidity_sweep,
+    "zscore":           evaluate_zscore_meanrev,
+    "session_vwap":     evaluate_session_vwap,
+    "bb_squeeze":       evaluate_bb_squeeze,
+    "engulfing_pivot":  evaluate_engulfing_pivot,
 }
