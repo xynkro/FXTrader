@@ -23,6 +23,18 @@ class Settings(BaseSettings):
     OANDA_ACCOUNT_ID: str = Field(default="")
     OANDA_ENV: Literal["practice", "live"] = "practice"
 
+    # Optional separate credentials for the LIVE environment. Live and
+    # practice use different API tokens, so a switch from demo to live
+    # requires either these to be set in .env or supplied via the
+    # /api/trading/switch-env endpoint at runtime.
+    OANDA_LIVE_API_KEY: str = Field(default="")
+    OANDA_LIVE_ACCOUNT_ID: str = Field(default="")
+
+    # Master flag: must be true for the engine to even consider switching
+    # OANDA_ENV from practice to live via the runtime API. Defends against
+    # accidental UI clicks before the demo window has completed.
+    ALLOW_LIVE_SWITCH: bool = False
+
     INSTRUMENT: str = "EUR_USD"
     GRANULARITY: str = "M5"
 

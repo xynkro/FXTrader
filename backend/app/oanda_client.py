@@ -285,3 +285,10 @@ def get_client() -> OandaClient:
     if _client is None:
         _client = OandaClient()
     return _client
+
+
+def reset_client() -> None:
+    """Drop the cached singleton so the next get_client() picks up new
+    settings (env / API key / account). Used by the env-switch path."""
+    global _client
+    _client = None

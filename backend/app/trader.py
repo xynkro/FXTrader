@@ -25,7 +25,7 @@ from typing import Optional
 from .config import settings
 from .db import trade_log
 from .models import EngineStatus, Side, Trade, TradeStatus
-from .oanda_client import OandaClient, OandaError, get_client
+from .oanda_client import OandaClient, OandaError, get_client, reset_client
 from .risk import risk
 from .strategy import (
     STRATEGIES,
@@ -553,6 +553,90 @@ class Engine:
         except OandaError as e:
             trade_log.log_event("ERROR", "kill_close_failed", str(e))
         trade_log.log_event("WARN", "manual_kill", "all positions closed")
+
+    # ------------------------------------------------------------------
+    async def switch_env(
+        self, target: str, api_key: str, account_id: str
+    ) -> dict:
+        """Hot-swap the OANDA environment between practice and live.
+
+        Steps (each one logged so a botched switch is reconstructible):
+          1. Disable trading + close any open positions on CURRENT env.
+          2. Stop the tick task.
+          3. Mutate settings (in-memory only — .env is unchanged).
+          4. Reset the OandaClient singleton so the new env is picked up.
+          5. Validate the new credentials with an account_summary call.
+             If that fails, roll back and raise.
+          6. Reset in-memory engine state (state, last_candle_time,
+             pending stops, equity).
+          7. Restart the tick task.
+        """
+        prev_env = settings.OANDA_ENV
+        prev_key = settings.OANDA_API_KEY
+        prev_account = settings.OANDA_ACCOUNT_ID
+
+        # 1. Stand down trading + close positions on outgoing env.
+        settings.TRADING_ENABLED = False
+        trade_log.log_event(
+            "WARN", "env_switch_begin",
+            f"{prev_env} → {target} (account={account_id})",
+        )
+        try:
+            await self.client.close_position(settings.INSTRUMENT)
+        except OandaError as e:
+            trade_log.log_event(
+                "WARN", "env_switch_close_warn", f"close on {prev_env}: {e}"
+            )
+
+        # 2. Stop tick task cleanly.
+        await self.stop()
+
+        # 3+4. Swap settings + drop client cache.
+        settings.OANDA_ENV = target  # type: ignore[assignment]
+        settings.OANDA_API_KEY = api_key
+        settings.OANDA_ACCOUNT_ID = account_id
+        reset_client()
+        self._client = None
+
+        # 5. Validate new creds. If this raises OandaError the api.py
+        #    handler will roll back the settings.
+        try:
+            snap = await self.client.account_snapshot()
+        except OandaError:
+            # Roll back here so engine state stays consistent even though
+            # api.py also restores the in-memory settings. (Defence in depth.)
+            settings.OANDA_ENV = prev_env  # type: ignore[assignment]
+            settings.OANDA_API_KEY = prev_key
+            settings.OANDA_ACCOUNT_ID = prev_account
+            reset_client()
+            self._client = None
+            # Restart the tick task so we don't leave the engine dead.
+            self.start()
+            raise
+
+        # 6. Reset volatile state — different account = different history.
+        self.state = StrategyState()
+        self.last_candle_time = None
+        self.last_signal_time = None
+        self._oanda_id_to_local.clear()
+        self._shadow_pending_stops.clear()
+        self._equity = snap.equity
+
+        # 7. Restart tick task.
+        self.start()
+        trade_log.log_event(
+            "WARN", "env_switch_done",
+            f"now on {target} account={account_id} balance={snap.balance:.2f} "
+            f"{snap.currency}",
+        )
+        return {
+            "ok": True,
+            "env": target,
+            "account": account_id,
+            "balance": snap.balance,
+            "currency": snap.currency,
+            "trading_enabled": False,  # caller must explicitly re-enable
+        }
 
     # ------------------------------------------------------------------
     def status(self) -> EngineStatus:

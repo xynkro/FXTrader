@@ -62,6 +62,11 @@ export interface Config {
   oanda_env: string;
   oanda_account_id: string;
   trading_enabled: boolean;
+  shadow_mode?: boolean;
+  strategy_name?: string;
+  available_strategies?: string[];
+  allow_live_switch?: boolean;
+  live_credentials_configured?: boolean;
   risk_per_trade_pct: number;
   max_trades_per_day: number;
   max_concurrent_positions: number;
@@ -70,6 +75,7 @@ export interface Config {
   consecutive_loss_limit: number;
   session_start_utc: string;
   session_end_utc: string;
+  strategy_params?: Record<string, number>;
 }
 
 export interface OandaPosition {

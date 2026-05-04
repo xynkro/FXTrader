@@ -18,8 +18,12 @@ import ControlPanel from "./components/ControlPanel";
 import EventsPanel from "./components/EventsPanel";
 import ConnectionHealth from "./components/ConnectionHealth";
 import EnvelopeStatus from "./components/EnvelopeStatus";
+import TabNav, { type TabKey } from "./components/TabNav";
+import StrategyView from "./components/StrategyView";
+import SettingsView from "./components/SettingsView";
 
 export default function App() {
+  const [tab, setTab] = useState<TabKey>("dashboard");
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [account, setAccount] = useState<AccountSnapshot | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
@@ -81,9 +85,11 @@ export default function App() {
     <div className="min-h-screen p-4 md:p-6 max-w-[1400px] mx-auto">
       <Header status={status} account={account} config={config} />
 
-      <div className="mb-4 -mt-2">
+      <div className="mb-3 -mt-2">
         <ConnectionHealth equity={equity} events={events} />
       </div>
+
+      <TabNav active={tab} onChange={setTab} />
 
       {error && (
         <div className="panel p-3 mb-4 border-danger/40 text-danger text-sm">
@@ -91,27 +97,37 @@ export default function App() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
-        <div className="lg:col-span-2">
-          <EquityChart points={equity} />
-        </div>
-        <div className="space-y-4">
-          <StatusPanel status={status} account={account} />
-          <ControlPanel status={status} onAction={refresh} />
-        </div>
-      </div>
+      {tab === "dashboard" && (
+        <>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+            <div className="lg:col-span-2">
+              <EquityChart points={equity} />
+            </div>
+            <div className="space-y-4">
+              <StatusPanel status={status} account={account} />
+              <ControlPanel status={status} onAction={refresh} />
+            </div>
+          </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-        <EnvelopeStatus status={status} config={config} trades={trades} />
-        <PositionsTable positions={positions} />
-      </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <EnvelopeStatus status={status} config={config} trades={trades} />
+            <PositionsTable positions={positions} />
+          </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-        <EventsPanel events={events} />
-        <div /> {/* spacer; trades table is full-width below */}
-      </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <EventsPanel events={events} />
+            <div />
+          </div>
 
-      <TradesTable trades={trades} />
+          <TradesTable trades={trades} />
+        </>
+      )}
+
+      {tab === "strategy" && <StrategyView config={config} />}
+
+      {tab === "settings" && (
+        <SettingsView config={config} onConfigChanged={refresh} />
+      )}
 
       <footer className="mt-6 text-xs text-muted text-center">
         FXTrader — {config?.oanda_env ?? "?"} env • account{" "}

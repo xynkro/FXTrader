@@ -38,6 +38,19 @@ export const api = {
   disable: () => post<{ trading_enabled: boolean }>("/api/trading/disable"),
   kill: () => post<{ killed: boolean }>("/api/kill"),
   resetKill: () => post<{ kill_switch_tripped: boolean }>("/api/reset-kill"),
+  switchEnv: (body: {
+    target: "practice" | "live";
+    confirmation: string;
+    live_api_key?: string;
+    live_account_id?: string;
+  }) => post<{
+    ok: boolean;
+    env?: string;
+    account?: string;
+    balance?: number;
+    currency?: string;
+    no_change?: boolean;
+  }>("/api/trading/switch-env", body),
 };
 
 export function openStatusSocket(
