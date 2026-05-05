@@ -52,6 +52,9 @@ class Engine:
         self._equity: float = 0.0
         # Pending trail updates per shadow trade (active next bar).
         self._shadow_pending_stops: dict[int, float] = {}
+        # Per-side last bar that we already logged a missed-setup for
+        # (stops repeat-logging on the same bar from multiple ticks).
+        self._last_missed_bar: dict[str, str] = {}
 
     @property
     def evaluate_fn(self):
@@ -121,10 +124,48 @@ class Engine:
 
         sig = self.evaluate_fn(self.state, snap.equity)
         if sig is None:
+            # Quarantined research log: if a setup would have fired but for
+            # the session-window gate, record it. Engine does NOT trade.
+            # Read-only data for future "extended-session" pre-registered test.
+            self._maybe_log_missed_setup()
             return
         self.last_signal_time = sig.time
 
         await self._open_trade_from_signal(sig, snap.equity)
+
+    # ------------------------------------------------------------------
+    def _maybe_log_missed_setup(self) -> None:
+        """If we're out-of-session and the strategy's vitals say all OTHER
+        gates pass, log a `missed_setup` INFO event. Quarantined research
+        signal — never opens a trade."""
+        from .strategy import compute_strategy_vitals
+        from .strategy import in_session as _in_session
+        if self.last_candle_time is None:
+            return
+        if _in_session(self.last_candle_time):
+            return  # in-session = handled by normal path or genuine no-setup
+        try:
+            v = compute_strategy_vitals(self.state, settings.STRATEGY_NAME)
+        except Exception:
+            return
+        if v.get("warming_up") or v.get("not_implemented"):
+            return
+        long_w = v.get("long", {}).get("would_fire_if_session_open", False)
+        short_w = v.get("short", {}).get("would_fire_if_session_open", False)
+        bar_t = self.last_candle_time.isoformat()[:16]
+        # Idempotency: only log once per bar
+        if long_w and self._last_missed_bar.get("LONG") != bar_t:
+            trade_log.log_event(
+                "INFO", "missed_setup",
+                f"LONG bar={bar_t} (out-of-session, gates aligned)",
+            )
+            self._last_missed_bar["LONG"] = bar_t
+        if short_w and self._last_missed_bar.get("SHORT") != bar_t:
+            trade_log.log_event(
+                "INFO", "missed_setup",
+                f"SHORT bar={bar_t} (out-of-session, gates aligned)",
+            )
+            self._last_missed_bar["SHORT"] = bar_t
 
     # ------------------------------------------------------------------
     async def _open_trade_from_signal(self, sig, equity: float) -> None:

@@ -1060,12 +1060,18 @@ def compute_pullback_vitals(state: StrategyState) -> dict:
         },
         "long": {
             "all_pass": all(g["ok"] for g in long_gates),
+            "would_fire_if_session_open": all(
+                g["ok"] for g in long_gates if g["label"] != "In session"
+            ),
             "passes": sum(1 for g in long_gates if g["ok"]),
             "total": len(long_gates),
             "gates": long_gates,
         },
         "short": {
             "all_pass": all(g["ok"] for g in short_gates),
+            "would_fire_if_session_open": all(
+                g["ok"] for g in short_gates if g["label"] != "In session"
+            ),
             "passes": sum(1 for g in short_gates if g["ok"]),
             "total": len(short_gates),
             "gates": short_gates,

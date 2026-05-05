@@ -97,6 +97,17 @@ async def events(limit: int = 200):
     return trade_log.recent_events(limit)
 
 
+@router.get("/missed_setups")
+async def missed_setups(limit: int = 100):
+    """Quarantined research log: bars where the strategy's gates fully
+    aligned but the setup was blocked by the session-window. Engine does
+    NOT trade these — they are recorded for future pre-registered
+    "extended session" tests, not for live execution."""
+    all_events = trade_log.recent_events(1000)
+    out = [e for e in all_events if e.get("event") == "missed_setup"]
+    return out[:limit]
+
+
 @router.get("/strategy_vitals")
 async def strategy_vitals():
     """Live gate-by-gate diagnostic of the configured strategy.
