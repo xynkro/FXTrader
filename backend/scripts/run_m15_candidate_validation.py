@@ -81,7 +81,7 @@ def annualised(start, end, eq0, eq1):
     return ((eq1 / eq0) ** (1.0 / years) - 1.0) * 100.0
 
 
-def evaluate(candles: list[Candle], label: str) -> dict:
+def evaluate(candles: list[Candle], label: str, instrument: str = "USD_JPY") -> dict:
     p = replace(StrategyParams(), **CANDIDATE)
     eval_fn = STRATEGIES["pullback"]
     r, trades, _, diag = run_backtest(
@@ -91,6 +91,7 @@ def evaluate(candles: list[Candle], label: str) -> dict:
         signal_in_session_only=True,
         force_close_at_session_end=False,
         macro_features=None,
+        instrument=instrument,
     )
     cagr = annualised(candles[0].time, candles[-1].time,
                       r.starting_equity, r.final_equity)
@@ -169,13 +170,13 @@ def main() -> int:
 
     # === Test 1: USD_JPY 2017-2021 ===
     print("=== Test 1: USD_JPY M15 2017-05 → 2021-05 (fresh) ===")
-    t1 = evaluate(usd_test, "USD_JPY_2017_2021")
+    t1 = evaluate(usd_test, "USD_JPY_2017_2021", instrument="USD_JPY")
     print(fmt(t1))
     print()
 
     # === Test 2: EUR_USD 2017-2021 ===
     print("=== Test 2: EUR_USD M15 2017-05 → 2021-05 (cross-instrument) ===")
-    t2 = evaluate(eur_test, "EUR_USD_2017_2021")
+    t2 = evaluate(eur_test, "EUR_USD_2017_2021", instrument="EUR_USD")
     print(fmt(t2))
     print()
 

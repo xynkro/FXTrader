@@ -84,9 +84,10 @@ def _apply_costs(
     action: str,
     spread_pips: float,
     slippage_pips: float,
+    instrument: str,
 ) -> float:
     """Add round-trip half-spread + slippage to the trader's detriment."""
-    cost = (spread_pips / 2.0 + slippage_pips) * pip_size(settings.INSTRUMENT)
+    cost = (spread_pips / 2.0 + slippage_pips) * pip_size(instrument)
     if action == "entry":
         return price + cost if side == Side.LONG else price - cost
     return price - cost if side == Side.LONG else price + cost
@@ -102,12 +103,20 @@ def run_backtest(
     force_close_at_session_end: bool = True,
     evaluate_fn: Optional[Callable] = None,
     macro_features: Optional[dict] = None,
+    instrument: Optional[str] = None,
 ) -> tuple[BacktestResult, list[BTTrade], list[tuple[str, float]], dict]:
     if not candles:
         raise ValueError("no candles supplied")
 
+    # Instrument is needed for pip_size lookups (skip floors, friction costs,
+    # diagnostic pip stats). Defaults to settings.INSTRUMENT for backwards
+    # compat with the deployed engine; cross-instrument backtests must pass
+    # explicitly or the wrong pip size silently breaks min_atr_pips/min_stop_pips.
+    instr = instrument or settings.INSTRUMENT
+
     p = params or StrategyParams()
     state = StrategyState(params=p)
+    state.instrument = instr
     if macro_features is not None:
         state.macro = macro_features
     eval_fn = evaluate_fn or evaluate_default
@@ -137,7 +146,7 @@ def run_backtest(
             )
             if stop_hit:
                 exit_price = _apply_costs(
-                    side, stop, "exit", spread_pips, slippage_pips
+                    side, stop, "exit", spread_pips, slippage_pips, instr
                 )
                 stop_label = (
                     "trailing_stop" if open_trade.get("trailed", False)
@@ -159,7 +168,7 @@ def run_backtest(
                 pending_signal = None
             else:
                 fill_price = _apply_costs(
-                    sig.side, bar.open, "entry", spread_pips, slippage_pips
+                    sig.side, bar.open, "entry", spread_pips, slippage_pips, instr
                 )
                 stop_distance = sig.stop_distance
                 # Recompute stop from actual fill (locked semantic)
@@ -209,7 +218,7 @@ def run_backtest(
         ):
             side = open_trade["side"]
             exit_price = _apply_costs(
-                side, bar.open, "exit", spread_pips, slippage_pips
+                side, bar.open, "exit", spread_pips, slippage_pips, instr
             )
             equity = _close_trade(
                 open_trade, exit_price, bar.time, "session_end",
@@ -251,15 +260,15 @@ def run_backtest(
     if open_trade is not None:
         side = open_trade["side"]
         exit_price = _apply_costs(
-            side, candles[-1].close, "exit", spread_pips, slippage_pips
+            side, candles[-1].close, "exit", spread_pips, slippage_pips, instr
         )
         equity = _close_trade(
             open_trade, exit_price, candles[-1].time, "forced_eod",
             trades, equity_curve, equity,
         )
 
-    summary = _summarize(candles, trades, equity_curve, starting_equity, equity)
-    diagnostics = _diagnostics_dict(diag, trades, spread_pips, slippage_pips)
+    summary = _summarize(candles, trades, equity_curve, starting_equity, equity, instr)
+    diagnostics = _diagnostics_dict(diag, trades, spread_pips, slippage_pips, instr)
     return summary, trades, equity_curve, diagnostics
 
 
@@ -316,12 +325,13 @@ def _summarize(
     equity_curve: list[tuple[str, float]],
     starting_equity: float,
     final_equity: float,
+    instrument: str,
 ) -> BacktestResult:
     n = len(trades)
     if n == 0:
         return BacktestResult(
             start=candles[0].time, end=candles[-1].time,
-            instrument=settings.INSTRUMENT, bars=len(candles),
+            instrument=instrument, bars=len(candles),
             trades=0, wins=0, losses=0, win_rate=0.0, avg_r=0.0,
             expectancy_pct=0.0, total_return_pct=0.0,
             max_drawdown_pct=0.0, sharpe=0.0, profit_factor=0.0,
@@ -357,7 +367,7 @@ def _summarize(
 
     return BacktestResult(
         start=candles[0].time, end=candles[-1].time,
-        instrument=settings.INSTRUMENT, bars=len(candles),
+        instrument=instrument, bars=len(candles),
         trades=n, wins=wins, losses=losses, win_rate=win_rate,
         avg_r=avg_r, expectancy_pct=expectancy_pct,
         total_return_pct=total_ret, max_drawdown_pct=max_dd,
@@ -371,6 +381,7 @@ def _diagnostics_dict(
     trades: list[BTTrade],
     spread_pips: float,
     slippage_pips: float,
+    instrument: str,
 ) -> dict:
     durations = [t.bars_held for t in trades]
     avg_dur = float(np.mean(durations)) if durations else 0.0
@@ -402,7 +413,7 @@ def _diagnostics_dict(
 
     # Friction tax metric: round-trip cost as % of initial stop distance.
     cost_pips_round_trip = spread_pips + 2.0 * slippage_pips
-    pip_units = pip_size(settings.INSTRUMENT)
+    pip_units = pip_size(instrument)
     stop_dists_pips = [
         abs(t.entry_price - t.initial_stop) / pip_units for t in trades
     ]

@@ -117,12 +117,20 @@ class StrategyState:
     # Bigger window so pullback (sma_long=100) and compression (lookback=100)
     # have full warmup history available. Daily swing strategies need 200+
     # bars (~10 months) for SMA(50) etc; bumped accordingly.
-    candles: deque = field(default_factory=lambda: deque(maxlen=400))
+    # 600 bars: enough for any current strategy + V1 H1-gated needs ~440
+    # M15 bars to compute H1 SMA(100) + slope(10).
+    candles: deque = field(default_factory=lambda: deque(maxlen=600))
     long_cooldown: int = 0
     short_cooldown: int = 0
     # Macro features (date -> {us10y_pct, jp10y_pct, yield_diff, vix})
     # Empty for intraday/non-macro strategies; populated for swing.
     macro: dict = field(default_factory=dict)
+    # Instrument the candles are from (for pip_size lookup). Backtests should
+    # set this explicitly via run_backtest's `instrument` arg; live engine
+    # leaves empty and falls back to settings.INSTRUMENT. Without this,
+    # cross-instrument backtests silently use the global INSTRUMENT's pip
+    # size — bug surfaced during M15 v2 cross-instrument validation.
+    instrument: str = ""
 
     def add(self, c: Candle) -> None:
         if self.candles and self.candles[-1].time == c.time:
@@ -233,7 +241,7 @@ def _preamble(
     a = atr(highs, lows, closes, p.atr_period)
     if np.isnan(a):
         return skip("warmup"), None
-    pip = pip_size(settings.INSTRUMENT)
+    pip = pip_size(state.instrument or settings.INSTRUMENT)
     atr_pips = a / pip
     if atr_pips < p.min_atr_pips:
         return skip("atr_below_min"), None
@@ -293,6 +301,41 @@ def evaluate_donchian(
             reason=f"donchian_short N{n} ATR{atr_pips:.1f}p lo={prev_low:.5f}",
         )
     _record_skip(diagnostics, "no_breakout"); return None
+
+
+# --- Multi-timeframe helpers --------------------------------------------
+def aggregate_to_h1(m15_candles) -> list[Candle]:
+    """Aggregate a list/deque of M15 candles into H1 OHLC bars.
+
+    Groups by (date, hour); only includes H1 buckets with all 4 expected
+    M15 bars (incomplete hours dropped — last bar of input may be excluded).
+
+    Used by V1 (H1-gated M15 pullback) per docs/pullback-m15-v3-research-plan.md.
+    For backtests on M15 streams, this is a self-contained way to get the
+    higher-timeframe view without a separate data feed.
+    """
+    bars = list(m15_candles)
+    if not bars:
+        return []
+    bucket: dict = {}
+    for c in bars:
+        key = (c.time.year, c.time.month, c.time.day, c.time.hour)
+        bucket.setdefault(key, []).append(c)
+    h1: list[Candle] = []
+    for key in sorted(bucket.keys()):
+        group = bucket[key]
+        if len(group) < 4:
+            continue  # incomplete hour
+        group.sort(key=lambda b: b.time)
+        h1.append(Candle(
+            time=group[0].time.replace(minute=0),
+            open=group[0].open,
+            high=max(b.high for b in group),
+            low=min(b.low for b in group),
+            close=group[-1].close,
+            volume=sum(b.volume for b in group),
+        ))
+    return h1
 
 
 # --- Class B: Pullback-in-trend -----------------------------------------
@@ -365,6 +408,262 @@ def evaluate_pullback(
         )
 
     _record_skip(diagnostics, "no_pullback_setup"); return None
+
+
+# --- Class B-V1: Pullback-in-trend (M15) gated by H1 regime --------------
+def evaluate_pullback_h1_gated(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """V1 — Pullback (intended for M15) with H1 regime permission gate.
+
+    See docs/pullback-m15-v3-research-plan.md.
+
+    Hypothesis: M15 pullback edge exists ONLY when the H1 timeframe
+    independently confirms a directional, healthy regime. Failure mode
+    attacked: M15 firing during H1-flat / H1-choppy regimes (caused
+    most of the v2 candidate's bleed in 2017-18, 2018-19, 2020-21).
+
+    H1 regime gate (most recent CLOSED H1 bar, aggregated from M15):
+      - close > SMA(100)
+      - SMA(100) slope positive over last 10 H1 bars
+      - ATR(14) ≥ 8 pips
+      - (close - SMA(100)) ≥ 0.5 × ATR(14)
+    Mirror conditions for shorts.
+
+    All M15 entry conditions from `evaluate_pullback` apply on top of the
+    gate. The gate is a HARD permission layer — both sides must agree
+    direction, not just the M15 side.
+    """
+    p = state.params
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.sma_long + p.trend_slope_lookback,
+                       p.atr_period + 1, p.pullback_lookback + 1),
+    )
+    if ctx is None:
+        return pre_skip
+
+    # === H1 regime gate (locked constants per pre-registered spec) ===
+    H1_SMA_PERIOD = 100
+    H1_SLOPE_LOOKBACK = 10
+    H1_ATR_PERIOD = 14
+    H1_ATR_FLOOR_PIPS = 8.0
+    H1_DIST_FACTOR = 0.5
+
+    h1 = aggregate_to_h1(state.candles)
+    if len(h1) < H1_SMA_PERIOD + H1_SLOPE_LOOKBACK:
+        _record_skip(diagnostics, "h1_warmup")
+        return None
+
+    h1_closes = np.array([c.close for c in h1], dtype=float)
+    h1_highs = np.array([c.high for c in h1], dtype=float)
+    h1_lows = np.array([c.low for c in h1], dtype=float)
+
+    h1_sma_now = float(h1_closes[-H1_SMA_PERIOD:].mean())
+    h1_sma_prev = float(
+        h1_closes[-H1_SMA_PERIOD - H1_SLOPE_LOOKBACK : -H1_SLOPE_LOOKBACK].mean()
+    )
+    h1_atr_value = atr(h1_highs, h1_lows, h1_closes, H1_ATR_PERIOD)
+    if np.isnan(h1_atr_value):
+        _record_skip(diagnostics, "h1_warmup")
+        return None
+
+    pip = pip_size(state.instrument or settings.INSTRUMENT)
+    h1_atr_pips = h1_atr_value / pip
+    h1_close_now = float(h1_closes[-1])
+
+    h1_uptrend = (h1_close_now > h1_sma_now) and (h1_sma_now > h1_sma_prev)
+    h1_downtrend = (h1_close_now < h1_sma_now) and (h1_sma_now < h1_sma_prev)
+    h1_atr_ok = h1_atr_pips >= H1_ATR_FLOOR_PIPS
+    h1_dist_long = (h1_close_now - h1_sma_now) >= H1_DIST_FACTOR * h1_atr_value
+    h1_dist_short = (h1_sma_now - h1_close_now) >= H1_DIST_FACTOR * h1_atr_value
+
+    long_h1_ok = h1_uptrend and h1_atr_ok and h1_dist_long
+    short_h1_ok = h1_downtrend and h1_atr_ok and h1_dist_short
+
+    if not (long_h1_ok or short_h1_ok):
+        _record_skip(diagnostics, "h1_regime")
+        return None
+
+    # === M15 pullback logic (mirror evaluate_pullback) ===
+    last = ctx["last"]
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_window.append(float(closes[-p.sma_short - i : -i].mean()))
+
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback_touched = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback_touched = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    up_trend = last.close > sma_long_now and sma_long_now > sma_long_prev
+    down_trend = last.close < sma_long_now and sma_long_now < sma_long_prev
+
+    if (long_h1_ok and up_trend and last.close > sma_short_now
+            and long_pullback_touched):
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long")
+            return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v1_h1gated_long m15_smal={sma_long_now:.5f} "
+                f"h1_smal={h1_sma_now:.5f} h1_atr={h1_atr_pips:.1f}p "
+                f"m15_atr={atr_pips:.1f}p"
+            ),
+        )
+    if (short_h1_ok and down_trend and last.close < sma_short_now
+            and short_pullback_touched):
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short")
+            return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v1_h1gated_short m15_smal={sma_long_now:.5f} "
+                f"h1_smal={h1_sma_now:.5f} h1_atr={h1_atr_pips:.1f}p "
+                f"m15_atr={atr_pips:.1f}p"
+            ),
+        )
+
+    _record_skip(diagnostics, "no_setup")
+    return None
+
+
+# --- Class B-V3: Pullback (M15) with restart confirmation ----------------
+def evaluate_pullback_restart_conf(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """V3 — Pullback (intended for M15) with restart confirmation.
+
+    See docs/pullback-m15-v3-research-plan.md.
+
+    Hypothesis: 'touch SMA then go' is too weak — strategy fires on
+    drifting retracements that never re-accelerate. Requiring evidence
+    the pullback has ENDED (continuation has RESTARTED) before entry
+    should improve trade quality and profit factor.
+
+    Confirmation rule (chosen ONE specific mechanism, not a knob hunt):
+      - For longs: signal bar's high > prior bar's high
+      - For shorts: signal bar's low < prior bar's low
+
+    All other v2 candidate conditions remain. The cost of confirmation
+    is later entry; the benefit (claim) is filtering out limp
+    continuations that never restart.
+    """
+    p = state.params
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        # Need at least 2 bars for the prior-bar break check
+        min_warmup=max(p.sma_long + p.trend_slope_lookback,
+                       p.atr_period + 1, p.pullback_lookback + 1, 2),
+    )
+    if ctx is None:
+        return pre_skip
+
+    candles = ctx["candles"]
+    if len(candles) < 2:
+        _record_skip(diagnostics, "warmup")
+        return None
+    last = ctx["last"]
+    prev_bar = candles[-2]
+
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_window.append(float(closes[-p.sma_short - i : -i].mean()))
+
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback_touched = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback_touched = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    up_trend = last.close > sma_long_now and sma_long_now > sma_long_prev
+    down_trend = last.close < sma_long_now and sma_long_now < sma_long_prev
+
+    # === Restart confirmation gate ===
+    long_break = last.high > prev_bar.high
+    short_break = last.low < prev_bar.low
+
+    if (up_trend and last.close > sma_short_now and long_pullback_touched
+            and long_break):
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long")
+            return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v3_restart_long sma_l={sma_long_now:.5f} "
+                f"sma_s={sma_short_now:.5f} prevH={prev_bar.high:.5f} "
+                f"thisH={last.high:.5f} ATR{atr_pips:.1f}p"
+            ),
+        )
+    if (down_trend and last.close < sma_short_now and short_pullback_touched
+            and short_break):
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short")
+            return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v3_restart_short sma_l={sma_long_now:.5f} "
+                f"sma_s={sma_short_now:.5f} prevL={prev_bar.low:.5f} "
+                f"thisL={last.low:.5f} ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    # Diagnose what held us back: pullback aligned but no restart break?
+    if (up_trend and last.close > sma_short_now and long_pullback_touched
+            and not long_break):
+        _record_skip(diagnostics, "no_long_restart")
+        return None
+    if (down_trend and last.close < sma_short_now and short_pullback_touched
+            and not short_break):
+        _record_skip(diagnostics, "no_short_restart")
+        return None
+    _record_skip(diagnostics, "no_setup")
+    return None
 
 
 # --- Class C: Volatility compression -> expansion -----------------------
@@ -902,15 +1201,17 @@ evaluate = evaluate_donchian
 
 
 STRATEGIES = {
-    "donchian":         evaluate_donchian,
-    "pullback":         evaluate_pullback,
-    "volsqueeze":       evaluate_volsqueeze,
-    "liquidity_sweep":  evaluate_liquidity_sweep,
-    "zscore":           evaluate_zscore_meanrev,
-    "session_vwap":     evaluate_session_vwap,
-    "bb_squeeze":       evaluate_bb_squeeze,
-    "engulfing_pivot":  evaluate_engulfing_pivot,
-    "swing_carry":      evaluate_swing_carry,
+    "donchian":              evaluate_donchian,
+    "pullback":              evaluate_pullback,
+    "pullback_h1_gated":     evaluate_pullback_h1_gated,       # V1
+    "pullback_restart_conf": evaluate_pullback_restart_conf,   # V3
+    "volsqueeze":            evaluate_volsqueeze,
+    "liquidity_sweep":       evaluate_liquidity_sweep,
+    "zscore":                evaluate_zscore_meanrev,
+    "session_vwap":          evaluate_session_vwap,
+    "bb_squeeze":            evaluate_bb_squeeze,
+    "engulfing_pivot":       evaluate_engulfing_pivot,
+    "swing_carry":           evaluate_swing_carry,
 }
 
 
@@ -945,7 +1246,7 @@ def compute_pullback_vitals(state: StrategyState) -> dict:
     lows   = np.array([c.low   for c in candles], dtype=float)
 
     a = atr(highs, lows, closes, p.atr_period)
-    pip = pip_size(settings.INSTRUMENT)
+    pip = pip_size(state.instrument or settings.INSTRUMENT)
     atr_pips = a / pip if not np.isnan(a) else 0.0
     stop_distance = p.stop_atr_mult * a if not np.isnan(a) else 0.0
     stop_pips = stop_distance / pip if pip > 0 else 0.0

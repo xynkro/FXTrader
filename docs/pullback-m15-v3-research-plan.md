@@ -278,10 +278,38 @@ verdict.)
 | Step | Action | Date | Status |
 |------|--------|------|--------|
 | 0 | Write this spec | 2026-05-06 | DONE |
-| 1 | Wait for Pullback H1 demo to conclude | — | pending demo end |
-| 2 | Fix `pip_size()` strategy-code bug | — | pending |
-| 3 | Verify USD_JPY M15 2014-2017 data availability | — | pending |
-| 4 | Implement Variant 1 (H1 regime gate) — code work | — | pending |
-| 5 | Run Variant 1 on fresh data | — | pending |
-| 6 | Apply Variant 1 decision | — | pending |
-| 7+ | Variants 3 and/or 2 if needed | — | conditional |
+| 1 | Wait for Pullback H1 demo to conclude | — | superseded — research ran in parallel |
+| 2 | Fix `pip_size()` strategy-code bug | 2026-05-06 | DONE — threaded `instrument` through StrategyState + run_backtest |
+| 3 | Verify USD_JPY M15 2014-2017 data availability | 2026-05-06 | DONE — downloaded 12y M15 (2014-05 → 2026-05, 298k bars) |
+| 4 | Implement Variant 1 (H1 regime gate) — code work | 2026-05-06 | DONE — `aggregate_to_h1()` helper + `evaluate_pullback_h1_gated` + STRATEGIES registration |
+| 5 | Run Variant 1 on fresh data | 2026-05-06 | DONE — `run_v1_validation.py` |
+| 6 | Apply Variant 1 decision | 2026-05-06 | **FAILED — 5/7 bars: V1 Sharpe -0.46 (worse than v2 -0.30). H1 gate redundant with M15 SMA(200).** |
+| 7 | Implement Variant 3 (restart confirmation) | 2026-05-06 | DONE — `evaluate_pullback_restart_conf` (break of prior bar high/low) |
+| 8 | Run Variant 3 on fresh data | 2026-05-06 | DONE — `run_v3_validation.py` |
+| 9 | Apply Variant 3 decision | 2026-05-06 | **FAILED — 4/7 bars + ALL 3 falsification triggers fired. WR up but expectancy down (entry too late), PF unchanged from v2.** |
+| 10 | **BRANCH KILL** | 2026-05-06 | **M15 pullback family officially DEAD. V1+V3 both failed per pre-reg rule. V2 (session filter) NOT pursued — explicitly flagged as "weakest save".** |
+| 11 | H1 deployed freshness check (2014-2017) | 2026-05-06 | DONE — H1 default params: Sharpe +0.35, CAGR +1.04%, PF 1.09. Asymmetric finding: H1 = 2/3 positive years, M15 family = 1/3. |
+
+## Outcome summary
+
+**Branch dead.** All three pullback M15 hypotheses pre-registered here have either failed (V1, V3) or were explicitly de-prioritized as cosmetic by the framework (V2). The data has spoken: there is no parameter or single-axis structural modification of M15 pullback on USD/JPY that produces an edge robust to a 2014-2017 fresh-data test.
+
+**Deployed H1 vindicated (mildly).** The same fresh-data check on the LIVE Pullback H1 default produced a weak-but-real Sharpe of +0.35 and PF of 1.09 — meaningfully different from the M15 family's outright negative results. H1 has 2 of 3 fresh years positive vs M15's 1 of 3.
+
+**The 2015-16 USD/JPY chop window broke every variant tested**, including H1 default. This is a structural property of trend-following on USD/JPY during major policy regime shifts (BoJ negative rates, post-CNY-devaluation, Brexit, US election). Bounded and recoverable at 0.25% sizing, but a known weakness.
+
+**Lessons for future research**:
+1. "Slow H1 logic on a faster timeframe" is a dead hypothesis class on this instrument.
+2. Adding a permission gate that overlaps the existing trend filter is null information.
+3. Confirmation rules that require waiting one extra bar tend to give away the move (validated empirically).
+4. Pre-registered fresh-data validation is non-negotiable; the OOS-of-optimization is contaminated.
+5. The 2015-16 chop window should be a standard stress test for any trend-following candidate going forward.
+
+## Pivot directions for v4
+
+Don't pursue more pullback variants on USD/JPY. Candidate research directions worth a fresh pre-registered cycle:
+
+- **Different family**: mean-reversion at session VWAP with regime-aware sizing
+- **Different instrument**: EUR/USD or AUD/USD pullback (after `pip_size` bug fix, which is now done)
+- **Different timeframe direction**: D1 swing carry-momentum (already coded, marginal in earlier tests but pre-registered cleanly is worth revisiting)
+- **Different stress profile**: build a regime-detection layer that pauses trading during 2015-16-like volatility/correlation breakdowns
