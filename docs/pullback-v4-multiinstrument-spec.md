@@ -62,22 +62,34 @@ lower portfolio vol — a Sharpe improvement of roughly 12%.
 
 ### Pair selection
 
-**v4 deployment pool** (must all pass pre-deployment validation):
-- USD_JPY (currently deployed, 5y Sharpe +0.69, freshness passed at +0.35)
-- GBP_JPY (5y Sharpe +1.01, freshness passed at +0.27)
-- EUR_JPY (5y Sharpe +0.54, freshness PENDING)
+**v4 deployment pool — UPDATED 2026-05-06 after EUR_JPY freshness ran**:
+- **USD_JPY** (currently deployed, 5y Sharpe +0.69, freshness passed at +0.35)
+- **GBP_JPY** (5y Sharpe +1.01, freshness passed at +0.27)
 
 **Excluded from v4**:
+- ~~EUR_JPY~~ — 5y Sharpe +0.54 looked like a 3rd-pair candidate, but
+  Stage 1 freshness test came in at Sharpe +0.26, which **fails bar 1A
+  (≥ +0.30) by 0.04**. Per the spec's locked rule, it drops out. Same
+  2015-16 catastrophe pattern (CAGR −1.89% that year).
 - AUD_JPY (5y Sharpe +0.25 — too marginal)
 - NZD_JPY (5y Sharpe −0.59 — fails)
 - All non-JPY pairs (negative on this strategy)
 
+**v4 is therefore a 2-pair portfolio.** This is exactly the fallback
+scenario the spec anticipated — the discipline of pre-registered bars
+caught a borderline candidate that would have been seductive to keep.
+
 ### Risk allocation rule
 
-**LOCKED choice**: each instrument gets `RISK_PER_TRADE_PCT / 3` per
-trade. With current `RISK_PER_TRADE_PCT=0.25%`, each instrument trades
-at 0.0833% per trade. Total max risk per concurrent-trade-trio = 0.25%
-(same as current single-instrument single-trade).
+**LOCKED choice**: each instrument gets `RISK_PER_TRADE_PCT / N` per
+trade, where N is the number of pairs in the deployment pool. The
+total max risk per concurrent-pair-trade equals one
+`RISK_PER_TRADE_PCT` worth of exposure — i.e. the same as the current
+single-instrument single-trade max.
+
+**Current 2-pair pool (USD_JPY + GBP_JPY)** with `RISK_PER_TRADE_PCT=0.25%`:
+- Each instrument: 0.125% per trade
+- Both concurrent: 0.25% max risk in the trio (same as current single)
 
 **Rejected alternatives**:
 - *Half-size each (1/2 RISK)*: 0.125% per pair × 3 pairs = 0.375%
@@ -241,7 +253,7 @@ If any fail → roll back to single-instrument, document, learn.
 | 2 | Test new JPY pairs (AUD/EUR/NZD) on deployed defaults | 2026-05-06 | DONE — EUR_JPY qualifies, AUD/NZD don't |
 | 3 | Write this v4 spec | 2026-05-06 | DONE |
 | 4 | Wait for current Pullback H1 demo to conclude | — | pending |
-| 5 | EUR_JPY freshness validation (Stage 1) | — | pending |
+| 5 | EUR_JPY freshness validation (Stage 1) | 2026-05-06 | DONE — FAILED bar 1A (Sharpe 0.26 vs ≥0.30 threshold). DROPPED. v4 becomes 2-pair portfolio. |
 | 6 | Engineering: multi-instrument refactor | — | pending |
 | 7 | Stage 2 portfolio backtest | — | pending |
 | 8 | Stage 3 live demo at third-size sizing | — | pending |
