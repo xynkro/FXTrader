@@ -1098,6 +1098,248 @@ def evaluate_engulfing_pivot(
     _record_skip(diagnostics, "no_engulfing_or_pin"); return None
 
 
+# --- Class TV-A: Forex Master v4.0 (Stable_Camel) -----------------------
+# Source: https://www.tradingview.com/script/AIZqyS45/  (Pine v2)
+# Original instrument: EUR/USD. Class: mean-reversion + ADX-falling filter.
+# Faithful port: Bollinger(20, 1.5σ) + Wilder ADX(50) smoothed by EMA(6) vs EMA(12),
+# fixed 50-pip TP, fixed 50-pip SL (= author's 500 ticks default on 5-decimal pricing).
+# We keep the source's logic intact; we do NOT add ATR-scaled stops here. A
+# separate "_atr" variant could be added later as an explicitly-labeled
+# optional improvement. Per workflow-doc rule #5 (don't invent features).
+def evaluate_tv_forex_master_v4(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+
+    # --- locked TV constants ---
+    BB_LEN = 20
+    BB_MULT = 1.5
+    ADX_LEN = 50
+    ADX_FAST = 6
+    ADX_SLOW = 12
+    TP_PIPS = 50.0
+    SL_PIPS = 50.0
+
+    # Universal preamble (warmup + session + ATR floor for sanity).
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        # Need ADX_LEN + buffer for the smoothing chain; +1 for the prev-bar cross check.
+        min_warmup=max(ADX_LEN + 30, BB_LEN + 2),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]
+    pip = pip_size(state.instrument or settings.INSTRUMENT)
+
+    # --- BB (current and prev bar — for cross detection) ---
+    def bb_at(end: int) -> tuple[float, float, float]:
+        """Returns (basis, upper, lower) using closes[:end] window."""
+        window = closes[end - BB_LEN : end]
+        basis = float(window.mean())
+        sd = float(window.std(ddof=0))
+        return basis, basis + BB_MULT * sd, basis - BB_MULT * sd
+
+    n = len(closes)
+    _, upper_now, lower_now = bb_at(n)
+    _, upper_prev, lower_prev = bb_at(n - 1)
+    close_now = float(closes[-1])
+    close_prev = float(closes[-2])
+
+    # --- Wilder ADX with EMA smoothing (matches Pine source verbatim) ---
+    # SmoothedTR[i] = SmoothedTR[i-1] - SmoothedTR[i-1]/ADX_LEN + TR[i]
+    smoothed_tr = 0.0
+    smoothed_dm_plus = 0.0
+    smoothed_dm_minus = 0.0
+    dx_series: list[float] = []
+    for i in range(1, n):
+        h_i, l_i, c_prev = float(highs[i]), float(lows[i]), float(closes[i - 1])
+        h_prev, l_prev = float(highs[i - 1]), float(lows[i - 1])
+        tr = max(h_i - l_i, abs(h_i - c_prev), abs(l_i - c_prev))
+        dm_plus = max(h_i - h_prev, 0.0) if (h_i - h_prev) > (l_prev - l_i) else 0.0
+        dm_minus = max(l_prev - l_i, 0.0) if (l_prev - l_i) > (h_i - h_prev) else 0.0
+        smoothed_tr = smoothed_tr - smoothed_tr / ADX_LEN + tr
+        smoothed_dm_plus = smoothed_dm_plus - smoothed_dm_plus / ADX_LEN + dm_plus
+        smoothed_dm_minus = smoothed_dm_minus - smoothed_dm_minus / ADX_LEN + dm_minus
+        if smoothed_tr <= 0:
+            continue
+        di_plus = smoothed_dm_plus / smoothed_tr * 100.0
+        di_minus = smoothed_dm_minus / smoothed_tr * 100.0
+        denom = di_plus + di_minus
+        if denom <= 0:
+            continue
+        dx = abs(di_plus - di_minus) / denom * 100.0
+        dx_series.append(dx)
+
+    if len(dx_series) < ADX_SLOW + 2:
+        _record_skip(diagnostics, "warmup")
+        return None
+
+    # EMA(6) and EMA(12) of DX
+    def ema_series(values: list[float], length: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2.0 / (length + 1.0)
+        out = [values[0]]
+        for v in values[1:]:
+            out.append(out[-1] + alpha * (v - out[-1]))
+        return out
+
+    ema_fast = ema_series(dx_series, ADX_FAST)
+    ema_slow = ema_series(dx_series, ADX_SLOW)
+    adx_falling = ema_fast[-1] < ema_slow[-1]
+
+    # --- Cross conditions (Pine v2 crossover/crossunder) ---
+    long_cross = (close_prev <= lower_prev) and (close_now > lower_now)
+    short_cross = (close_prev >= upper_prev) and (close_now < upper_now)
+
+    if long_cross and adx_falling:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        stop_distance = SL_PIPS * pip
+        target_distance = TP_PIPS * pip
+        return Signal(
+            time=last.time, side=Side.LONG, entry=close_now,
+            stop=close_now - stop_distance,
+            target=close_now + target_distance,
+            atr=a, stop_distance=stop_distance,
+            reason=(
+                f"tv_fmaster4_long bb_lo={lower_now:.5f} adx_fast={ema_fast[-1]:.1f}<"
+                f"slow={ema_slow[-1]:.1f} TP={TP_PIPS}p SL={SL_PIPS}p"
+            ),
+        )
+    if short_cross and adx_falling:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        stop_distance = SL_PIPS * pip
+        target_distance = TP_PIPS * pip
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=close_now,
+            stop=close_now + stop_distance,
+            target=close_now - target_distance,
+            atr=a, stop_distance=stop_distance,
+            reason=(
+                f"tv_fmaster4_short bb_up={upper_now:.5f} adx_fast={ema_fast[-1]:.1f}<"
+                f"slow={ema_slow[-1]:.1f} TP={TP_PIPS}p SL={SL_PIPS}p"
+            ),
+        )
+    _record_skip(diagnostics, "no_setup"); return None
+
+
+# --- Class TV-B: FX Master Long/Short (Stable_Camel) --------------------
+# Source: https://www.tradingview.com/script/Figho5B3/  (Pine v2)
+# Original instrument: EUR/USD. Class: smoothed-RSI threshold momentum.
+# Faithful port: long = crossover(EMA(20) of RSI(10), 50);
+#                short = crossunder(EMA(30) of RSI(30), 50)
+# Same fixed 50-pip TP/SL.
+def evaluate_tv_fx_master_longshort(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+
+    # --- locked TV constants (asymmetric per source) ---
+    LONG_RSI_LEN = 10
+    LONG_EMA_LEN = 20
+    SHORT_RSI_LEN = 30
+    SHORT_EMA_LEN = 30
+    THRESHOLD = 50.0
+    TP_PIPS = 50.0
+    SL_PIPS = 50.0
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(SHORT_RSI_LEN + SHORT_EMA_LEN + 2, LONG_RSI_LEN + LONG_EMA_LEN + 2),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes = ctx["closes"]
+    a = ctx["atr"]
+    pip = pip_size(state.instrument or settings.INSTRUMENT)
+
+    def rsi_series(prices: np.ndarray, length: int) -> list[float]:
+        """Wilder RSI matching Pine's rsi() output."""
+        if len(prices) < length + 1:
+            return []
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        # Wilder smoothing: avg_gain = (avg_gain[t-1] * (length-1) + gain[t]) / length
+        avg_g = float(gains[:length].mean())
+        avg_l = float(losses[:length].mean())
+        out = []
+        for i in range(length, len(deltas)):
+            avg_g = (avg_g * (length - 1) + gains[i]) / length
+            avg_l = (avg_l * (length - 1) + losses[i]) / length
+            if avg_l == 0:
+                out.append(100.0)
+            else:
+                rs = avg_g / avg_l
+                out.append(100.0 - 100.0 / (1.0 + rs))
+        return out
+
+    def ema_series(values: list[float], length: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2.0 / (length + 1.0)
+        out = [values[0]]
+        for v in values[1:]:
+            out.append(out[-1] + alpha * (v - out[-1]))
+        return out
+
+    long_rsi = rsi_series(closes, LONG_RSI_LEN)
+    long_ema = ema_series(long_rsi, LONG_EMA_LEN)
+    short_rsi = rsi_series(closes, SHORT_RSI_LEN)
+    short_ema = ema_series(short_rsi, SHORT_EMA_LEN)
+
+    if len(long_ema) < 2 or len(short_ema) < 2:
+        _record_skip(diagnostics, "warmup")
+        return None
+
+    long_cross = long_ema[-2] <= THRESHOLD and long_ema[-1] > THRESHOLD
+    short_cross = short_ema[-2] >= THRESHOLD and short_ema[-1] < THRESHOLD
+    close_now = float(closes[-1])
+
+    if long_cross:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        stop_distance = SL_PIPS * pip
+        target_distance = TP_PIPS * pip
+        return Signal(
+            time=last.time, side=Side.LONG, entry=close_now,
+            stop=close_now - stop_distance,
+            target=close_now + target_distance,
+            atr=a, stop_distance=stop_distance,
+            reason=(
+                f"tv_fxmasterls_long rsi_ema={long_ema[-1]:.1f} cross 50 "
+                f"TP={TP_PIPS}p SL={SL_PIPS}p"
+            ),
+        )
+    if short_cross:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        stop_distance = SL_PIPS * pip
+        target_distance = TP_PIPS * pip
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=close_now,
+            stop=close_now + stop_distance,
+            target=close_now - target_distance,
+            atr=a, stop_distance=stop_distance,
+            reason=(
+                f"tv_fxmasterls_short rsi_ema={short_ema[-1]:.1f} cross 50 "
+                f"TP={TP_PIPS}p SL={SL_PIPS}p"
+            ),
+        )
+    _record_skip(diagnostics, "no_setup"); return None
+
+
 # --- Class S: Swing Carry-Momentum (daily) ------------------------------
 def evaluate_swing_carry(
     state: StrategyState,
@@ -1212,6 +1454,9 @@ STRATEGIES = {
     "bb_squeeze":            evaluate_bb_squeeze,
     "engulfing_pivot":       evaluate_engulfing_pivot,
     "swing_carry":           evaluate_swing_carry,
+    # TradingView-imported (Stable_Camel, Pine v2, faithful ports):
+    "tv_forex_master_v4":     evaluate_tv_forex_master_v4,
+    "tv_fx_master_longshort": evaluate_tv_fx_master_longshort,
 }
 
 

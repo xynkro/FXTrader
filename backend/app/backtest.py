@@ -137,7 +137,10 @@ def run_backtest(
             open_trade["next_stop"] = None
 
         # --- 2. Stop-out check using the active stop ---
+        # Convention: if both stop and target are within bar's range,
+        # assume stop hits first (worst-case-for-trader, standard backtest assumption).
         exited_by_stop = False
+        exited_by_tp = False
         if open_trade is not None:
             side = open_trade["side"]
             stop = open_trade["stop"]
@@ -159,6 +162,28 @@ def run_backtest(
                 state.trip_cooldown(side)   # cooldown ONLY after stop-out
                 open_trade = None
                 exited_by_stop = True
+
+        # --- 2b. Take-profit check (only if not already stopped out this bar) ---
+        # Strategies that emit a Signal with `target` set (TV-imported fixed-TP/SL
+        # systems) exit at TP when bar's range crosses it. Trail-based strategies
+        # leave target=None, so this branch is skipped.
+        if open_trade is not None and not exited_by_stop:
+            target = open_trade.get("target")
+            if target is not None:
+                side = open_trade["side"]
+                tp_hit = (
+                    bar.high >= target if side == Side.LONG else bar.low <= target
+                )
+                if tp_hit:
+                    exit_price = _apply_costs(
+                        side, target, "exit", spread_pips, slippage_pips, instr
+                    )
+                    equity = _close_trade(
+                        open_trade, exit_price, bar.time, "take_profit",
+                        trades, equity_curve, equity,
+                    )
+                    open_trade = None
+                    exited_by_tp = True
 
         # --- 3. Activate pending entry at this bar's open ---
         if open_trade is None and pending_signal is not None:
@@ -183,6 +208,15 @@ def run_backtest(
                 if capped:
                     diag.leverage_cap_binds += 1
                 if units > 0:
+                    # If the signal has a take-profit target, recompute it
+                    # relative to the actual fill (locked semantic, same as stop).
+                    if sig.target is not None:
+                        if sig.side == Side.LONG:
+                            tp_price = fill_price + (sig.target - sig.entry)
+                        else:
+                            tp_price = fill_price - (sig.entry - sig.target)
+                    else:
+                        tp_price = None
                     open_trade = {
                         "side": sig.side,
                         "entry_time": bar.time,
@@ -190,6 +224,7 @@ def run_backtest(
                         "initial_stop": initial_stop,
                         "stop": initial_stop,
                         "next_stop": None,
+                        "target": tp_price,
                         "atr_at_entry": sig.atr,
                         "stop_distance": stop_distance,
                         "units": units,
@@ -213,6 +248,7 @@ def run_backtest(
         if (
             open_trade is not None
             and not exited_by_stop
+            and not exited_by_tp
             and force_close_at_session_end
             and not in_session(bar.time)
         ):
