@@ -123,3 +123,46 @@ export interface StrategyVitals {
   long?: VitalSide;
   short?: VitalSide;
 }
+
+// --- Sensitivity dashboard (read-only, pre-computed) -------------------
+export interface SensitivityMetrics {
+  trades: number;
+  win_rate_pct: number;
+  expectancy_pct: number;
+  total_return_pct: number;
+  cagr_pct: number;
+  max_dd_pct: number;
+  sharpe: number;
+  profit_factor: number;
+  avg_r: number;
+  error?: string;
+}
+
+export interface SensitivityPoint {
+  value: number;
+  metrics: SensitivityMetrics;
+}
+
+export interface SensitivityParam {
+  deployed_value: number;
+  values: number[];
+  results: SensitivityPoint[];
+}
+
+export interface Sensitivity {
+  available: boolean;
+  message?: string;
+  generated_at?: string;
+  strategy?: string;
+  instrument?: string;
+  granularity?: string;
+  data_window_bars?: number;
+  data_window_start?: string;
+  data_window_end?: string;
+  spread_pips?: number;
+  slippage_pips?: number;
+  deployed_params?: Record<string, number>;
+  baseline_metrics?: SensitivityMetrics;
+  sweeps?: Record<string, SensitivityParam>;
+  disclaimer?: string;
+}

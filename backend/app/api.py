@@ -1,6 +1,7 @@
 """HTTP API for the PWA dashboard."""
 from __future__ import annotations
 
+import json
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -117,6 +118,37 @@ async def strategy_vitals():
     a strategy is or isn't firing right now.
     """
     return compute_strategy_vitals(engine.state, settings.STRATEGY_NAME)
+
+
+@router.get("/sensitivity")
+async def sensitivity():
+    """Pre-computed parameter sensitivity sweep for the deployed strategy.
+
+    Read-only. Generated offline by `python -m scripts.run_sensitivity`
+    from backend/. The PWA renders this as static curves — there is
+    intentionally no "apply this value" workflow, because cherry-picking
+    parameter values from an in-sample sweep is the canonical
+    backtest-overfitting trap.
+
+    The dashboard's purpose is to expose fragility (= sharp peaks at the
+    deployed value) vs robustness (= broad plateaus). It is a diagnostic,
+    not a recommender.
+    """
+    path = settings.backtest_dir / "sensitivity_pullback.json"
+    if not path.exists():
+        return {
+            "available": False,
+            "message": (
+                "Sensitivity data not yet generated. Run "
+                "`python -m scripts.run_sensitivity` from backend/ to "
+                "produce it."
+            ),
+        }
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        return {"available": False, "message": f"corrupt JSON: {e}"}
+    return {"available": True, **data}
 
 
 @router.post("/trading/enable")

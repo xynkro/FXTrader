@@ -5,6 +5,7 @@ import type {
   EngineStatus,
   EquityPoint,
   OandaPosition,
+  Sensitivity,
   StrategyVitals,
   Trade,
 } from "../types";
@@ -36,6 +37,7 @@ export const api = {
   equity: (limit = 5000) => get<EquityPoint[]>(`/api/equity?limit=${limit}`),
   events: (limit = 200) => get<EngineEvent[]>(`/api/events?limit=${limit}`),
   strategyVitals: () => get<StrategyVitals>("/api/strategy_vitals"),
+  sensitivity: () => get<Sensitivity>("/api/sensitivity"),
   enable: () => post<{ trading_enabled: boolean }>("/api/trading/enable"),
   disable: () => post<{ trading_enabled: boolean }>("/api/trading/disable"),
   kill: () => post<{ killed: boolean }>("/api/kill"),

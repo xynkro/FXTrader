@@ -1,4 +1,5 @@
 import type { Config } from "../types";
+import SensitivityPanel from "./SensitivityPanel";
 
 /**
  * Plain-English explanation of the Pullback-in-trend strategy currently
@@ -300,6 +301,9 @@ units_capped    = min(units, max_leverage × equity / notional_per_u)`}
           for the full pre-registered specifications.
         </p>
       </div>
+
+      {/* --- Parameter sensitivity (Tier 1 diagnostic) --- */}
+      <SensitivityPanel />
     </div>
   );
 }
