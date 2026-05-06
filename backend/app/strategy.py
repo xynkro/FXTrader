@@ -666,6 +666,276 @@ def evaluate_pullback_restart_conf(
     return None
 
 
+# --- Class B-V5α: Pullback + ADX-falling no-trade filter ----------------
+# Insight extracted from TV-A's mean-reversion logic, INVERTED.
+# Hypothesis: Pullback's losing trades cluster in regimes where ADX is
+# decreasing (trend dying). Skip those entries.
+# Spec: docs/v5-alpha-beta-specs.md
+def evaluate_pullback_adx_filter(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    """v5-α: deployed Pullback rules + ADX-rising filter.
+
+    Reuses the deployed Pullback signal logic; adds a no-trade gate when
+    Wilder ADX (smoothed by EMA(6)/EMA(12)) is FALLING. Trades only fire
+    when EMA(6) of DX > EMA(12) of DX (trend acceleration / healthy trend).
+
+    Falsification triggers from spec:
+    - Trade count drops below 50/y → over-throttling
+    - Sharpe up but CAGR down → just trading less
+    - 2015-16 catastrophe year doesn't improve → filter doesn't fix
+      the actual failure mode
+    """
+    p = state.params
+
+    # --- locked ADX constants (from TV-A source, same Wilder ADX as Forex Master v4) ---
+    ADX_LEN = 50
+    ADX_FAST = 6
+    ADX_SLOW = 12
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.sma_long + p.trend_slope_lookback,
+                       p.atr_period + 1, p.pullback_lookback + 1, ADX_LEN + 30),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    n = len(closes)
+
+    # --- ADX (Wilder smoothing, EMA fast/slow) ---
+    smoothed_tr = 0.0
+    smoothed_dm_plus = 0.0
+    smoothed_dm_minus = 0.0
+    dx_series: list[float] = []
+    for i in range(1, n):
+        h_i, l_i, c_prev = float(highs[i]), float(lows[i]), float(closes[i - 1])
+        h_prev, l_prev = float(highs[i - 1]), float(lows[i - 1])
+        tr = max(h_i - l_i, abs(h_i - c_prev), abs(l_i - c_prev))
+        dm_plus = max(h_i - h_prev, 0.0) if (h_i - h_prev) > (l_prev - l_i) else 0.0
+        dm_minus = max(l_prev - l_i, 0.0) if (l_prev - l_i) > (h_i - h_prev) else 0.0
+        smoothed_tr = smoothed_tr - smoothed_tr / ADX_LEN + tr
+        smoothed_dm_plus = smoothed_dm_plus - smoothed_dm_plus / ADX_LEN + dm_plus
+        smoothed_dm_minus = smoothed_dm_minus - smoothed_dm_minus / ADX_LEN + dm_minus
+        if smoothed_tr <= 0:
+            continue
+        di_plus = smoothed_dm_plus / smoothed_tr * 100.0
+        di_minus = smoothed_dm_minus / smoothed_tr * 100.0
+        denom = di_plus + di_minus
+        if denom <= 0:
+            continue
+        dx_series.append(abs(di_plus - di_minus) / denom * 100.0)
+
+    if len(dx_series) < ADX_SLOW + 2:
+        _record_skip(diagnostics, "warmup_adx")
+        return None
+
+    def ema_series(values: list[float], length: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2.0 / (length + 1.0)
+        out = [values[0]]
+        for v in values[1:]:
+            out.append(out[-1] + alpha * (v - out[-1]))
+        return out
+
+    ema_fast = ema_series(dx_series, ADX_FAST)
+    ema_slow = ema_series(dx_series, ADX_SLOW)
+    adx_rising = ema_fast[-1] > ema_slow[-1]
+
+    if not adx_rising:
+        _record_skip(diagnostics, "adx_falling")
+        return None
+
+    # --- Pullback signal logic (mirror evaluate_pullback exactly) ---
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_window.append(float(closes[-p.sma_short - i : -i].mean()))
+
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback_touched = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback_touched = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    up_trend = last.close > sma_long_now and sma_long_now > sma_long_prev
+    down_trend = last.close < sma_long_now and sma_long_now < sma_long_prev
+
+    if up_trend and last.close > sma_short_now and long_pullback_touched:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v5a_pb_adxr_long sma_l={sma_long_now:.5f} adx_f={ema_fast[-1]:.1f}>"
+                f"slow={ema_slow[-1]:.1f} ATR{atr_pips:.1f}p"
+            ),
+        )
+    if down_trend and last.close < sma_short_now and short_pullback_touched:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v5a_pb_adxr_short sma_l={sma_long_now:.5f} adx_f={ema_fast[-1]:.1f}>"
+                f"slow={ema_slow[-1]:.1f} ATR{atr_pips:.1f}p"
+            ),
+        )
+    _record_skip(diagnostics, "no_setup")
+    return None
+
+
+# --- Class B-V5β: Pullback + smoothed-RSI momentum confirmation --------
+# Insight extracted from TV-B's smoothed-RSI threshold cross.
+# Hypothesis: Pullback's losing trades are setups where the trend
+# filter says yes but underlying momentum (smoothed RSI) is opposed.
+# Add EMA(20) of RSI(10) > 50 as a momentum-agreement gate.
+# Spec: docs/v5-alpha-beta-specs.md
+def evaluate_pullback_rsi_confirm(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+
+    LONG_RSI_LEN = 10
+    LONG_EMA_LEN = 20
+    SHORT_RSI_LEN = 30
+    SHORT_EMA_LEN = 30
+    THRESHOLD = 50.0
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(p.sma_long + p.trend_slope_lookback,
+                       p.atr_period + 1, p.pullback_lookback + 1,
+                       SHORT_RSI_LEN + SHORT_EMA_LEN + 2),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    closes, highs, lows = ctx["closes"], ctx["highs"], ctx["lows"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    # --- Smoothed RSI (mirrors evaluate_tv_fx_master_longshort) ---
+    def rsi_series(prices: np.ndarray, length: int) -> list[float]:
+        if len(prices) < length + 1:
+            return []
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_g = float(gains[:length].mean())
+        avg_l = float(losses[:length].mean())
+        out = []
+        for i in range(length, len(deltas)):
+            avg_g = (avg_g * (length - 1) + gains[i]) / length
+            avg_l = (avg_l * (length - 1) + losses[i]) / length
+            if avg_l == 0:
+                out.append(100.0)
+            else:
+                rs = avg_g / avg_l
+                out.append(100.0 - 100.0 / (1.0 + rs))
+        return out
+
+    def ema_series(values: list[float], length: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2.0 / (length + 1.0)
+        out = [values[0]]
+        for v in values[1:]:
+            out.append(out[-1] + alpha * (v - out[-1]))
+        return out
+
+    long_rsi = rsi_series(closes, LONG_RSI_LEN)
+    long_ema = ema_series(long_rsi, LONG_EMA_LEN)
+    short_rsi = rsi_series(closes, SHORT_RSI_LEN)
+    short_ema = ema_series(short_rsi, SHORT_EMA_LEN)
+
+    if not long_ema or not short_ema:
+        _record_skip(diagnostics, "warmup_rsi")
+        return None
+
+    long_momentum_ok = long_ema[-1] > THRESHOLD
+    short_momentum_ok = short_ema[-1] < THRESHOLD
+
+    # --- Pullback signal logic ---
+    sma_long_now = float(closes[-p.sma_long:].mean())
+    sma_long_prev = float(
+        closes[-p.sma_long - p.trend_slope_lookback : -p.trend_slope_lookback].mean()
+    )
+    sma_short_now = float(closes[-p.sma_short:].mean())
+
+    lb = p.pullback_lookback
+    sma_short_window = []
+    for i in range(1, lb + 1):
+        sma_short_window.append(float(closes[-p.sma_short - i : -i].mean()))
+
+    recent_lows = lows[-lb - 1 : -1]
+    recent_highs = highs[-lb - 1 : -1]
+    long_pullback_touched = any(
+        recent_lows[k] <= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+    short_pullback_touched = any(
+        recent_highs[k] >= sma_short_window[lb - 1 - k] for k in range(lb)
+    )
+
+    up_trend = last.close > sma_long_now and sma_long_now > sma_long_prev
+    down_trend = last.close < sma_long_now and sma_long_now < sma_long_prev
+
+    if (up_trend and last.close > sma_short_now and long_pullback_touched
+            and long_momentum_ok):
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v5b_pb_rsi_long sma_l={sma_long_now:.5f} rsiE={long_ema[-1]:.1f}"
+                f">50 ATR{atr_pips:.1f}p"
+            ),
+        )
+    if (down_trend and last.close < sma_short_now and short_pullback_touched
+            and short_momentum_ok):
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"v5b_pb_rsi_short sma_l={sma_long_now:.5f} rsiE={short_ema[-1]:.1f}"
+                f"<50 ATR{atr_pips:.1f}p"
+            ),
+        )
+    if up_trend and last.close > sma_short_now and long_pullback_touched and not long_momentum_ok:
+        _record_skip(diagnostics, "rsi_disagree_long"); return None
+    if down_trend and last.close < sma_short_now and short_pullback_touched and not short_momentum_ok:
+        _record_skip(diagnostics, "rsi_disagree_short"); return None
+    _record_skip(diagnostics, "no_setup")
+    return None
+
+
 # --- Class C: Volatility compression -> expansion -----------------------
 def evaluate_volsqueeze(
     state: StrategyState,
@@ -1340,6 +1610,85 @@ def evaluate_tv_fx_master_longshort(
     _record_skip(diagnostics, "no_setup"); return None
 
 
+# --- Class TV-C: Fractal Breakout (ChartArt) ----------------------------
+# Source: https://www.tradingview.com/script/EjLwVtgp/  (Pine v2)
+# Original instrument: not specified by author. Class: Williams Fractal
+# breakout, LONG ONLY in source.
+# Faithful port: detect 5-bar fractal tops (highs[i] > highs[i±1, i±2]),
+# track last 3 fractal-top prices, fire LONG when their rolling average is
+# rising AND the current bar's price > most recent fractal top.
+# IMPORTANT: source has NO stop loss and NO take profit. We add an
+# ATR(14)-scaled stop as an OPTIONAL IMPROVEMENT (labeled per workflow
+# rule #5) — without it, running this in live trading is dangerous.
+# Source's fractal-trend-reversal exit is approximated by our trail-stop
+# behavior; not strictly faithful but functionally similar.
+def evaluate_tv_fractal_breakout(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        # Need history for at least 4 fractal tops (each requires 5 bars)
+        # plus warmup for SMA/ATR. ~50 bars is comfortable minimum.
+        min_warmup=max(50, p.atr_period + 5),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    candles = ctx["candles"]
+    highs, lows, closes = ctx["highs"], ctx["lows"], ctx["closes"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    n = len(highs)
+    # Detect fractal tops: bar i is a fractal top if highs[i] is greater
+    # than highs[i-2..i+2] (5-bar pattern). We only check i where i+2 < n
+    # (fractal is confirmed 2 bars later).
+    fractal_top_prices: list[float] = []
+    for i in range(2, n - 2):
+        h = highs[i]
+        if (h > highs[i - 1] and h > highs[i - 2] and
+                h > highs[i + 1] and h > highs[i + 2]):
+            # Use hl2 of the fractal bar as the price (matches source default)
+            fractal_top_prices.append((highs[i] + lows[i]) / 2.0)
+
+    if len(fractal_top_prices) < 5:
+        _record_skip(diagnostics, "warmup_fractals")
+        return None
+
+    # Compute fractal_average and previous fractal_average (3-fractal window)
+    f_now = fractal_top_prices[-3:]
+    f_prev = fractal_top_prices[-4:-1]
+    avg_now = sum(f_now) / 3.0
+    avg_prev = sum(f_prev) / 3.0
+    fractal_trend_rising = avg_now > avg_prev
+
+    # Breakout: current bar's hl2 > most recent fractal top price
+    last_fractal_price = fractal_top_prices[-1]
+    current_price = (last.high + last.low) / 2.0
+    fractal_breakout = current_price > last_fractal_price
+
+    if fractal_trend_rising and fractal_breakout:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        # Optional improvement: ATR-scaled stop (source has none)
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"tv_fractal_long avg_now={avg_now:.5f} > avg_prev={avg_prev:.5f}, "
+                f"breakout {last_fractal_price:.5f} ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    _record_skip(diagnostics, "no_setup")
+    return None
+
+
 # --- Class S: Swing Carry-Momentum (daily) ------------------------------
 def evaluate_swing_carry(
     state: StrategyState,
@@ -1447,6 +1796,8 @@ STRATEGIES = {
     "pullback":              evaluate_pullback,
     "pullback_h1_gated":     evaluate_pullback_h1_gated,       # V1
     "pullback_restart_conf": evaluate_pullback_restart_conf,   # V3
+    "pullback_adx_filter":   evaluate_pullback_adx_filter,     # v5-α
+    "pullback_rsi_confirm":  evaluate_pullback_rsi_confirm,    # v5-β
     "volsqueeze":            evaluate_volsqueeze,
     "liquidity_sweep":       evaluate_liquidity_sweep,
     "zscore":                evaluate_zscore_meanrev,
@@ -1457,6 +1808,7 @@ STRATEGIES = {
     # TradingView-imported (Stable_Camel, Pine v2, faithful ports):
     "tv_forex_master_v4":     evaluate_tv_forex_master_v4,
     "tv_fx_master_longshort": evaluate_tv_fx_master_longshort,
+    "tv_fractal_breakout":    evaluate_tv_fractal_breakout,
 }
 
 
