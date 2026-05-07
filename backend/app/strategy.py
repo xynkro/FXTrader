@@ -1689,6 +1689,94 @@ def evaluate_tv_fractal_breakout(
     return None
 
 
+# --- Class TV-C-bidi: Fractal Breakout BIDIRECTIONAL (optional improvement) ---
+# Source TV-C is LONG-ONLY (Pine v2). This is an OPTIONAL IMPROVEMENT
+# that adds a Williams Fractal Bottoms mirror for SHORT entries — labeled
+# per workflow rule #5 (don't invent features unless explicitly optional).
+# Pre-registered question: does adding shorts improve or dilute TV-C's
+# performance on JPY pairs (which generally trend up)?
+def evaluate_tv_fractal_breakout_bidi(
+    state: StrategyState,
+    equity: float = 0.0,
+    diagnostics: Optional[dict] = None,
+) -> Optional[Signal]:
+    p = state.params
+
+    pre_skip, ctx = _preamble(
+        state, diagnostics,
+        min_warmup=max(50, p.atr_period + 5),
+    )
+    if ctx is None:
+        return pre_skip
+
+    last = ctx["last"]
+    candles = ctx["candles"]
+    highs, lows, closes = ctx["highs"], ctx["lows"], ctx["closes"]
+    a = ctx["atr"]; atr_pips = ctx["atr_pips"]; stop_distance = ctx["stop_distance"]
+
+    n = len(highs)
+
+    # Fractal tops (LONG side, faithful to source)
+    fractal_top_prices: list[float] = []
+    fractal_bottom_prices: list[float] = []
+    for i in range(2, n - 2):
+        h = highs[i]; l = lows[i]
+        if (h > highs[i - 1] and h > highs[i - 2] and
+                h > highs[i + 1] and h > highs[i + 2]):
+            fractal_top_prices.append((highs[i] + lows[i]) / 2.0)
+        # Mirror: fractal bottom = low[i] is lowest of 5 bars
+        if (l < lows[i - 1] and l < lows[i - 2] and
+                l < lows[i + 1] and l < lows[i + 2]):
+            fractal_bottom_prices.append((highs[i] + lows[i]) / 2.0)
+
+    if len(fractal_top_prices) < 5 or len(fractal_bottom_prices) < 5:
+        _record_skip(diagnostics, "warmup_fractals")
+        return None
+
+    # Long side (faithful to source)
+    avg_now_top = sum(fractal_top_prices[-3:]) / 3.0
+    avg_prev_top = sum(fractal_top_prices[-4:-1]) / 3.0
+    long_trend_rising = avg_now_top > avg_prev_top
+    last_top = fractal_top_prices[-1]
+    current_price = (last.high + last.low) / 2.0
+    long_breakout = current_price > last_top
+
+    # Short side (mirror — optional improvement)
+    avg_now_bot = sum(fractal_bottom_prices[-3:]) / 3.0
+    avg_prev_bot = sum(fractal_bottom_prices[-4:-1]) / 3.0
+    short_trend_falling = avg_now_bot < avg_prev_bot
+    last_bot = fractal_bottom_prices[-1]
+    short_breakout = current_price < last_bot
+
+    if long_trend_rising and long_breakout:
+        if state.long_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_long"); return None
+        return Signal(
+            time=last.time, side=Side.LONG, entry=last.close,
+            stop=last.close - stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"tv_fractal_bidi_long avg_now={avg_now_top:.5f}>{avg_prev_top:.5f}, "
+                f"break {last_top:.5f} ATR{atr_pips:.1f}p"
+            ),
+        )
+    if short_trend_falling and short_breakout:
+        if state.short_cooldown > 0:
+            _record_skip(diagnostics, "cooldown_short"); return None
+        return Signal(
+            time=last.time, side=Side.SHORT, entry=last.close,
+            stop=last.close + stop_distance, target=None, atr=a,
+            stop_distance=stop_distance,
+            reason=(
+                f"tv_fractal_bidi_short avg_now={avg_now_bot:.5f}<{avg_prev_bot:.5f}, "
+                f"break {last_bot:.5f} ATR{atr_pips:.1f}p"
+            ),
+        )
+
+    _record_skip(diagnostics, "no_setup")
+    return None
+
+
 # --- Class S: Swing Carry-Momentum (daily) ------------------------------
 def evaluate_swing_carry(
     state: StrategyState,
@@ -1809,6 +1897,7 @@ STRATEGIES = {
     "tv_forex_master_v4":     evaluate_tv_forex_master_v4,
     "tv_fx_master_longshort": evaluate_tv_fx_master_longshort,
     "tv_fractal_breakout":    evaluate_tv_fractal_breakout,
+    "tv_fractal_bidi":        evaluate_tv_fractal_breakout_bidi,  # optional improvement (long+short)
 }
 
 
